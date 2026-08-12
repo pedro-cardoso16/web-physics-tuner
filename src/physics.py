@@ -122,25 +122,6 @@ class Simulation:
             for particle in self.particles:
                 particle.update_vars(self.dt)
 
-            # for particle in self.particles:
-            #     ref = None
-            #     try:
-            #         ref = vars(particle.constraints[0].reference)
-            #     except:
-            #         pass
-            #     print(
-            #         f"id {i}:",
-            #         "x =",
-            #         particle.x,
-            #         "| v =",
-            #         particle.v,
-            #         "f =",
-            #         particle.f,
-            #         # "ref =",
-            #         # ref,
-            #     )
-            #     print()
-
             i += 1
 
 
