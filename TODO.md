@@ -1,0 +1,7 @@
+- [x] Test with **two** particles only (spring system)
+    - [x] One particle fixed
+    - [x] One particle free to move (1 dimension)
+- [ ] UI
+    - [ ] Display dots
+    - [ ] Display line segments connecting the two particles
+    - [ ] 
