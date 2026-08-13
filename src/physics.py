@@ -20,7 +20,7 @@ class Constraint:
 
     def compute_force(self) -> np.ndarray:
         kwargs = vars(self.reference)
-        return self.func(**kwargs) # type: ignore
+        return self.func(**kwargs)  # type: ignore
 
 
 class Particle:
@@ -63,7 +63,7 @@ class Particle:
         return a
 
     def compute_velocity(self, dt) -> np.ndarray:
-        self.v = (self.x - self.xp) / dt
+        self.v[:] = (self.x - self.xp) / dt
 
         return self.v
 
@@ -99,7 +99,7 @@ class Particle:
         for constraint in self.constraints:
             net_force += constraint.compute_force()
 
-        self.f[:] = net_force  
+        self.f[:] = net_force
         return self.f
 
 
@@ -289,7 +289,7 @@ def main() -> None:
         xt.append(particle2.x[0])
         yt.append(particle2.x[1])
 
-        print(round(end_time - start_time,2), end="                 \r")
+        print(round(end_time - start_time, 2), end="                 \r")
         if (end_time - start_time) > 100:
             break
 
