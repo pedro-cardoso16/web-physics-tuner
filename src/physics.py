@@ -152,6 +152,93 @@ def gravitational_force(m: float, g: np.ndarray = np.array((0.0, 9.8))):
     return m * g
 
 
+def dampening_force(k: float, v: np.ndarray) -> np.ndarray:
+    magnitude = np.linalg.norm(v)
+    return -k * magnitude * v
+
+
+def rigid_connection_force(
+    mass: float,
+    pos: np.ndarray,
+    velocity: np.ndarray,
+    pivot_pos: np.ndarray,
+    pivot_velocity: np.ndarray,
+    d_fixed: float,
+    dt: float,
+) -> np.ndarray:
+    """Rigid connection force
+
+    This force fixates the distance between the particle and the pivot. It calculates
+    the force assuming the pivot has infinite mass, that is all the force is applied to the
+    particle.
+
+    **This is like the elastic force with infinite elastic constant value.**
+
+    Args:
+        mass (float): Particle's mass.
+        pos (np.ndarray): Particle's current position.
+        velocity (np.ndarray): Particle's current velocity.
+        pivot_pos (np.ndarray): Pivot's current position.
+        pivot_velocity (np.ndarray): Pivot's current velocity.
+        d_fixed (float): Fixed distance between the pivot and the particle.
+        dt (float): Time interval into the future.
+
+    Returns:
+        f (np.ndarray): Net force required for position correction into the future.
+            Doesn't take into account other external forces, only current particle
+            and pivot's positions and velocities.
+    """
+    future_rel_pos = (pos - pivot_pos) + dt * (velocity - pivot_velocity)
+    future_rel_pos_norm = np.linalg.norm(future_rel_pos)
+    future_rel_pos_normalized = future_rel_pos / future_rel_pos_norm
+
+    f = -(mass / dt**2) * (future_rel_pos_norm - d_fixed) * future_rel_pos_normalized
+    return f
+
+
+def rope_force(
+    mass: float,
+    pos: np.ndarray,
+    velocity: np.ndarray,
+    pivot_pos: np.ndarray,
+    pivot_velocity: np.ndarray,
+    d_max: float,
+    dt: float,
+) -> np.ndarray:
+    """Rope connection force
+
+    This force fixates the maximum distance between the particle and the pivot.
+    It works exactly as [`rigid_connection_force`](rigit_connection_force) when
+    the distance is predicted to be above `d_max` `dt` seconds into the future.
+    It simply returns a zero-valued force otherwise.
+
+    Args:
+        mass (float): Particle's mass.
+        pos (np.ndarray): Particle's current position.
+        velocity (np.ndarray): Particle's current velocity.
+        pivot_pos (np.ndarray): Pivot's current position.
+        pivot_velocity (np.ndarray): Pivot's current velocity.
+        d_max (float): Max distance between the pivot and the particle.
+            Equivalent to a rope's length.
+        dt (float): Time interval into the future.
+
+    Returns:
+        f (np.ndarray): Net force required for position correction into the future.
+            Doesn't take into account other external forces, only current particle
+            and pivot's positions and velocities.
+    """
+    future_rel_pos = (pos - pivot_pos) + dt * (velocity - pivot_velocity)
+    future_rel_pos_norm = np.linalg.norm(future_rel_pos)
+
+    if future_rel_pos_norm <= d_max:
+        return np.zeros_like(pos)
+
+    future_rel_pos_normalized = future_rel_pos / future_rel_pos_norm
+
+    f = -(mass / dt**2) * (future_rel_pos_norm - d_max) * future_rel_pos_normalized
+    return f
+
+
 def stromer(x: NDArray, xp: NDArray, a: NDArray, dt: float) -> np.ndarray:
     """Computes next stromer position xn
 
