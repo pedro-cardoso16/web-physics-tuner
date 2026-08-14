@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from typing import Callable
 from numpy.typing import ArrayLike, NDArray
 
+
 class Reference:
     def __init__(self, **kwargs) -> None:
         for key, val in kwargs.items():
@@ -31,7 +32,9 @@ class Particle:
     ) -> None:
         self.m = m  # mass
         self.x: np.ndarray = np.array(x)  # current position
-        self.v: np.ndarray = np.array(v) if v is not None else np.zeros_like(x)  # current velocity
+        self.v: np.ndarray = (
+            np.array(v) if v is not None else np.zeros_like(x)
+        )  # current velocity
         self.a: np.ndarray = (
             np.array(a) if a is not None else np.zeros_like(x)
         )  # current acceleration
@@ -102,42 +105,171 @@ class Particle:
 class Simulation:
     def __init__(self, particles: list[Particle] = []) -> None:
         self.particles = particles
-        self.dt = 0.0001
+        self.dt = 0.001
+
+        # Vectorized state arrays
+        self.num_particles = len(particles)
+        if self.num_particles > 0:
+            self.pos = np.array([p.x for p in particles], dtype=np.float64)
+            self.vel = np.array([p.v for p in particles], dtype=np.float64)
+            self.acc = np.array([p.a for p in particles], dtype=np.float64)
+            self.prev_pos = np.array(
+                [p.xp if p.xp is not None else p.x for p in particles], dtype=np.float64
+            )
+            self.masses = np.array([p.m for p in particles], dtype=np.float64).reshape(
+                -1, 1
+            )
+        else:
+            self.pos = np.array([], dtype=np.float64)
+            self.vel = np.array([], dtype=np.float64)
+            self.acc = np.array([], dtype=np.float64)
+            self.prev_pos = np.array([], dtype=np.float64)
+            self.masses = np.array([], dtype=np.float64)
+
+        # Vectorized constraint caches
+        self.elastic_owner_indices = np.array([], dtype=np.int32)
+        self.elastic_indices_a = np.array([], dtype=np.int32)
+        self.elastic_indices_b = np.array([], dtype=np.int32)
+        self.elastic_k = np.array([], dtype=np.float64)
+        self.elastic_dr = np.array([], dtype=np.float64)
+
+        self.gravity_indices = np.array([], dtype=np.int32)
+        self.gravity_vecs = np.array([], dtype=np.float64)
+
+        self.dampening_indices = np.array([], dtype=np.int32)
+        self.dampening_k = np.array([], dtype=np.float64)
+
+    def build_vectorized_constraints(self) -> None:
+        """Compiles individual Particle constraints into vectorized NumPy arrays."""
+        e_owner, e_a, e_b, e_k, e_dr = [], [], [], [], []
+        g_idx, g_vec = [], []
+        d_idx, d_k = [], []
+
+        for idx, p in enumerate(self.particles):
+            for c in p.constraints:
+                ref = c.reference
+                # Check for elastic constraints
+                if (
+                    hasattr(ref, "x1")
+                    and hasattr(ref, "x2")
+                    and hasattr(ref, "k")
+                    and hasattr(ref, "dr")
+                ):
+                    x1_attr = getattr(ref, "x1", None)
+                    x2_attr = getattr(ref, "x2", None)
+                    if isinstance(x1_attr, Particle) and isinstance(x2_attr, Particle):
+                        try:
+                            x1_idx = self.particles.index(x1_attr)
+                            x2_idx = self.particles.index(x2_attr)
+                            # The resulting force always applies to the
+                            # constraint's owner (idx) - regardless of
+                            # whether the owner happens to be x1 or x2.
+                            e_owner.append(idx)
+                            e_a.append(x1_idx)
+                            e_b.append(x2_idx)
+                            e_k.append(getattr(ref, "k"))
+                            e_dr.append(getattr(ref, "dr"))
+                        except ValueError:
+                            pass
+                # Check for gravitational constraints
+                elif hasattr(ref, "g") and hasattr(ref, "particle"):
+                    g_idx.append(idx)
+                    g_vec.append(getattr(ref, "g"))
+                # Check for dampening constraints
+                elif (
+                    hasattr(ref, "k")
+                    and hasattr(ref, "particle")
+                    and not hasattr(ref, "x1")
+                ):
+                    d_idx.append(idx)
+                    d_k.append(getattr(ref, "k"))
+
+        self.elastic_owner_indices = np.array(e_owner, dtype=np.int32)
+        self.elastic_indices_a = np.array(e_a, dtype=np.int32)
+        self.elastic_indices_b = np.array(e_b, dtype=np.int32)
+        self.elastic_k = np.array(e_k, dtype=np.float64)
+        self.elastic_dr = np.array(e_dr, dtype=np.float64)
+
+        self.gravity_indices = np.array(g_idx, dtype=np.int32)
+        self.gravity_vecs = np.array(g_vec, dtype=np.float64)
+
+        self.dampening_indices = np.array(d_idx, dtype=np.int32)
+        self.dampening_k = np.array(d_k, dtype=np.float64)
 
     def run(self, n: int | None = None) -> None:
+        if self.num_particles == 0:
+            return
+
+        # Particles with no constraints stay frozen (0 acceleration)
+        fixed_mask = np.array([len(p.constraints) == 0 for p in self.particles])
+
         i = 0
         while True:
             if n is not None and i >= n:
                 break
 
-            # Vectorized acceleration computation
-            # To make this truly fast, we need to move away from per-particle loops
-            # and use NumPy's vectorization across the entire particle set.
-            
-            # First pass: compute accelerations
-            for particle in self.particles:
-                particle.compute_acceleration()
+            # 1. Vectorized force computation - calls the same force functions
+            #    used by individual constraints, just with batched inputs.
+            net_forces = np.zeros((self.num_particles, 2), dtype=np.float64)
 
-            # Second pass: update variables
-            for particle in self.particles:
-                particle.update_vars(self.dt)
+            if self.gravity_indices.size > 0:
+                net_forces[self.gravity_indices] += gravitational_force(
+                    self.masses[self.gravity_indices], self.gravity_vecs
+                )
+
+            if self.dampening_indices.size > 0:
+                net_forces[self.dampening_indices] += dampening_force(
+                    self.dampening_k[:, np.newaxis], self.vel[self.dampening_indices]
+                )
+
+            if self.elastic_indices_a.size > 0:
+                f_elastic = elastic_force(
+                    self.pos[self.elastic_indices_a],
+                    self.pos[self.elastic_indices_b],
+                    self.elastic_k[:, np.newaxis],
+                    self.elastic_dr[:, np.newaxis],
+                )
+                np.add.at(net_forces, self.elastic_owner_indices, f_elastic)
+
+            # 2. Vectorized acceleration: a = F / m
+            self.acc = net_forces / self.masses
+            self.acc[fixed_mask] = 0
+
+            # 3. Vectorized Stormer-Verlet integration (reuses `stromer`)
+            next_pos = stromer(self.pos, self.prev_pos, self.acc, self.dt)
+            self.prev_pos = self.pos.copy()
+            self.pos = next_pos
+
+            # 4. Vectorized velocity: v = (x - xp) / dt
+            self.vel = (self.pos - self.prev_pos) / self.dt
 
             i += 1
 
+        # Sync the vectorized state back to the particle objects once, at the end
+        for idx, particle in enumerate(self.particles):
+            particle.x = self.pos[idx]
+            particle.v = self.vel[idx]
+            particle.a = self.acc[idx]
+            particle.xp = self.prev_pos[idx]
 
-constraint_list = []
-particles: dict[str, Particle] = {}
+
+# constraint_list = []
+# particles: dict[str, Particle] = {}
 
 
 def elastic_force(
-    x1: np.ndarray, x2: np.ndarray, k: float, dr: float, d_min: float = 0.0001
+    x1: np.ndarray,
+    x2: np.ndarray,
+    k: float | np.ndarray,
+    dr: float | np.ndarray,
+    d_min: float | np.ndarray = 0.0001,
 ) -> np.ndarray:
 
     dx = x2 - x1
-    d = np.linalg.norm(dx)
+    d = np.linalg.norm(dx, axis=-1, keepdims=True)
 
     # select between itself and the minimal distance, avoids force explosion.
-    d = np.max((d, d_min))
+    d = np.maximum(d, d_min)
 
     dxu = dx / d  # dx unitary vector
     f = dxu * (k * (d - dr))  # force
@@ -165,20 +297,24 @@ def make_elastic_constraint(
     """
     # Store particles directly so we always access current positions
     ref = Reference(x1=particle1, x2=particle2, k=k, dr=dr, d_min=d_min)
-    
+
     # Create wrapper function that extracts positions on-demand
     def elastic_force_wrapper(**kwargs):
-        p1 = kwargs['x1']
-        p2 = kwargs['x2']
-        return elastic_force(p1.x if isinstance(p1, Particle) else p1,
-                            p2.x if isinstance(p2, Particle) else p2,
-                            kwargs['k'], kwargs['dr'], kwargs['d_min'])
-    
+        p1 = kwargs["x1"]
+        p2 = kwargs["x2"]
+        return elastic_force(
+            p1.x if isinstance(p1, Particle) else p1,
+            p2.x if isinstance(p2, Particle) else p2,
+            kwargs["k"],
+            kwargs["dr"],
+            kwargs["d_min"],
+        )
+
     return Constraint(elastic_force_wrapper, reference=ref)
 
 
-def gravitational_force(m: float, g: np.ndarray = np.array((0.0, 9.8))):
-    if m <= 0:
+def gravitational_force(m: float | np.ndarray, g: np.ndarray = np.array((0.0, 9.8))):
+    if np.any(np.asarray(m) <= 0):
         raise ValueError("The mass (m) must be a positive number.")
 
     return m * g
@@ -189,45 +325,45 @@ def make_gravitational_constraint(
 ) -> Constraint:
     """
     Create a gravitational force constraint from a Particle instance.
-    
+
     Args:
         particle: Particle instance
         g: Gravitational acceleration vector (default: (0, 9.8))
-        
+
     Returns:
         Constraint: Ready-to-use constraint for the particle
     """
     ref = Reference(particle=particle, g=g)
-    
+
     def gravitational_force_wrapper(**kwargs):
-        p = kwargs['particle']
-        return gravitational_force(p.m, kwargs['g'])
-    
+        p = kwargs["particle"]
+        return gravitational_force(p.m, kwargs["g"])
+
     return Constraint(gravitational_force_wrapper, reference=ref)
 
 
-def dampening_force(k: float, v: np.ndarray) -> np.ndarray:
-    magnitude = np.linalg.norm(v)
+def dampening_force(k: float | np.ndarray, v: np.ndarray) -> np.ndarray:
+    magnitude = np.linalg.norm(v, axis=-1, keepdims=True)
     return -k * magnitude * v
 
 
 def make_dampening_constraint(particle: Particle, k: float) -> Constraint:
     """
     Create a dampening force constraint from a Particle instance.
-    
+
     Args:
         particle: Particle instance
         k: Dampening coefficient
-        
+
     Returns:
         Constraint: Ready-to-use constraint for the particle
     """
     ref = Reference(particle=particle, k=k)
-    
+
     def dampening_force_wrapper(**kwargs):
-        p = kwargs['particle']
-        return dampening_force(kwargs['k'], p.v)
-    
+        p = kwargs["particle"]
+        return dampening_force(kwargs["k"], p.v)
+
     return Constraint(dampening_force_wrapper, reference=ref)
 
 
@@ -275,27 +411,27 @@ def make_rigid_connection_constraint(
 ) -> Constraint:
     """
     Create a rigid connection force constraint from two Particle instances.
-    
+
     Args:
         particle: The particle to apply force to
         pivot_particle: The pivot/fixed particle
         d_fixed: Fixed distance between particles
         dt: Time interval
-        
+
     Returns:
         Constraint: Ready-to-use constraint
     """
-    ref = Reference(particle=particle, pivot_particle=pivot_particle, d_fixed=d_fixed, dt=dt)
-    
+    ref = Reference(
+        particle=particle, pivot_particle=pivot_particle, d_fixed=d_fixed, dt=dt
+    )
+
     def rigid_connection_wrapper(**kwargs):
-        p = kwargs['particle']
-        pp = kwargs['pivot_particle']
+        p = kwargs["particle"]
+        pp = kwargs["pivot_particle"]
         return rigid_connection_force(
-            p.m, p.x, p.v,
-            pp.x, pp.v,
-            kwargs['d_fixed'], kwargs['dt']
+            p.m, p.x, p.v, pp.x, pp.v, kwargs["d_fixed"], kwargs["dt"]
         )
-    
+
     return Constraint(rigid_connection_wrapper, reference=ref)
 
 
@@ -347,27 +483,25 @@ def make_rope_constraint(
 ) -> Constraint:
     """
     Create a rope force constraint from two Particle instances.
-    
+
     Args:
         particle: The particle to apply force to
         pivot_particle: The pivot/fixed particle
         d_max: Maximum distance (rope length)
         dt: Time interval
-        
+
     Returns:
         Constraint: Ready-to-use constraint
     """
-    ref = Reference(particle=particle, pivot_particle=pivot_particle, d_max=d_max, dt=dt)
-    
+    ref = Reference(
+        particle=particle, pivot_particle=pivot_particle, d_max=d_max, dt=dt
+    )
+
     def rope_wrapper(**kwargs):
-        p = kwargs['particle']
-        pp = kwargs['pivot_particle']
-        return rope_force(
-            p.m, p.x, p.v,
-            pp.x, pp.v,
-            kwargs['d_max'], kwargs['dt']
-        )
-    
+        p = kwargs["particle"]
+        pp = kwargs["pivot_particle"]
+        return rope_force(p.m, p.x, p.v, pp.x, pp.v, kwargs["d_max"], kwargs["dt"])
+
     return Constraint(rope_wrapper, reference=ref)
 
 
@@ -378,6 +512,7 @@ def set_constraint(constraint_func: Callable, **kwargs) -> Constraint:
         setattr(reference, key, kwargs[key])
 
     return Constraint(constraint_func, reference)
+
 
 def add_constraint_to_particle(particle: Particle, *constraint: Constraint) -> None:
     particle.constraints.extend(constraint)
