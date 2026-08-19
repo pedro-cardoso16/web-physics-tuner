@@ -1,3 +1,5 @@
+[![](https://img.shields.io/badge/buy_me_a_coffee-gold?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pedro.cardoso)
+[![]()]()
 # web-physics-tuner
 Python tool optimizing soft-body physics (ropes, banners) for web games. 
 Uses AI tuning to generate lightweight JSON configs, ensuring 60fps performance 
@@ -16,13 +18,12 @@ subgraph ImageProcessing [Image Processing]
     Denoiser(Denoiser) --> Skeletonizer(Skeletonizer) --> NodeGen(Node Generator)
 end
 
-NodeGen --> Nodes["Nodes' positions and velocities per frame in json format"]
+NodeGen --> Nodes["Nodes' positions and velocities\nper frame in json format"]
 Nodes --> Optimizer
 
 subgraph ReverseEngine [Reverse Engine]
     Optimizer(Optimizer)
 end
-
 ```
 
 
