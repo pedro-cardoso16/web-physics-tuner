@@ -8,11 +8,17 @@ account the 2D movement, completely ignoring the 3D motion.
 import os
 import cv2 as cv
 import numpy as np
-
 import networkx as nx
+import json
+
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from numpy.typing import ArrayLike
 from cv2.typing import MatLike
 from itertools import product
 from collections.abc import Mapping
+from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
 
 os.environ["QT_LOGGING_RULES"] = "*.warning=false"
 os.environ["QT_QPA_PLATFORM"] = "xcb"
@@ -147,10 +153,9 @@ def extract_clean_ordered_path(skeleton_img, anchor_pt=None):
             subgraph, start_node, weight="weight"
         )
 
-
         assert isinstance(distance, Mapping) and isinstance(path, Mapping)
 
-        for target_node, path_nodes in path.items(): 
+        for target_node, path_nodes in path.items():
             if distance[target_node] > max_path_len:
                 max_path_len = distance[target_node]
                 longest_path = path_nodes
@@ -180,7 +185,7 @@ def extract_clean_ordered_path(skeleton_img, anchor_pt=None):
 
 def calculate_path_length(path: np.ndarray) -> float:
     """Calculate total length of the path in pixels.
-    
+
     Args:
         path
     """
@@ -252,7 +257,7 @@ def resample_path_to_n_nodes(path: np.ndarray, n_nodes: int) -> np.ndarray:
     return np.array(resampled_path, dtype=np.float32)
 
 
-def visualize_nodes(vis_img, resampled_path, node_radius=4):
+def visualize_nodes(vis_img, resampled_path, node_radius=4) -> None:
     """Draw resampled nodes on the visualization image."""
     for i, (x, y) in enumerate(resampled_path):
         # Draw node
@@ -276,24 +281,178 @@ def visualize_nodes(vis_img, resampled_path, node_radius=4):
         cv.line(vis_img, pt1, pt2, (0, 255, 0), 2)
 
 
-if __name__ == "__main__":
-    img = cv.imread("media/imgs/rope.ppm", cv.IMREAD_GRAYSCALE)
-    assert img is not None
+def get_minimum_distance_index_array(a: ArrayLike, b: ArrayLike) -> np.ndarray:
+    """Get minimum distance index array
+
+    Outputs the index order of `b` based on `a` order. That is `a` order is
+    unchanged and outputs the reordering of `b` so as to match `a` order.
+
+    Args:
+        a (ArrayLike): First array
+        b (ArrayLike): Second array, which is to be ordered according to `a`
+    """
+
+    cost_matrix = cdist(a, b, metric="euclidean")
+
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+    assert isinstance(row_ind, np.ndarray) and isinstance(col_ind, np.ndarray)
+
+    index_array = np.argsort(row_ind)
+
+    return col_ind[index_array]
+
+
+def extract_nodes_from_image(
+    img: MatLike | str,
+    n_nodes: int = 20,
+    thresh: int | None = None,
+    anchor_pt: np.ndarray | None = None,
+) -> np.ndarray | None:
+    if isinstance(img, str):
+        out = cv.imread(img, cv.IMREAD_GRAYSCALE)
+
+        if out is None:
+            return
+
+        img = out
 
     # --- Pre-thinning ---
-    img_skeleton = preprocess_and_skeletonize(img)
+    img_skeleton = preprocess_and_skeletonize(img, thresh)
 
     # --- Extract Path ---
-    path = extract_clean_ordered_path(img_skeleton)
+    path = extract_clean_ordered_path(img_skeleton, anchor_pt)
 
     # --- Resample to N Nodes ---
-    n_nodes = 20  # Adjust based on your needs
     resampled_path = resample_path_to_n_nodes(path, n_nodes)
 
-    # --- Visualize ---
-    vis_img = cv.cvtColor(img_skeleton, cv.COLOR_GRAY2BGR)
-    visualize_nodes(vis_img, resampled_path)
+    return resampled_path
 
-    cv.imshow("Resampled Nodes", vis_img)
-    cv.waitKey(0)
-    cv.destroyAllWindows()
+
+def extract_info_from_image(
+    frame_timestamp_tuple: tuple,
+    n_nodes: int = 20,
+    thresh: int | None = None,
+    anchor_pt: np.ndarray | None = None,
+):
+    frame, timestamp = frame_timestamp_tuple
+    return extract_nodes_from_image(frame, n_nodes, thresh, anchor_pt), timestamp
+
+
+def extract_nodes_from_video(
+    vid: cv.VideoCapture | str, n_nodes: int = 20, max_workers: int | None = None
+) -> np.ndarray:
+    if isinstance(vid, str):
+        vid = cv.VideoCapture(vid)
+
+    total_frames = int(vid.get(cv.CAP_PROP_FRAME_COUNT))
+
+    def read_frame():
+        ret, frame = vid.read()
+        if ret:
+            frame = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+            timestamp = vid.get(cv.CAP_PROP_POS_MSEC) / 1000
+            return (frame, timestamp)
+        return None
+
+    def frame_generator():
+        while True:
+            data = read_frame()
+            if data is None:
+                break
+            yield data
+
+    output = []
+    nodes_list = []
+    timestamps = []
+
+    with ProcessPoolExecutor(max_workers) as executor:
+
+        results = executor.map(extract_info_from_image, frame_generator())
+
+        for result in tqdm(results, total=total_frames, desc="Processing Frames"):
+            if result is None:
+                continue
+
+            nodes_list.append(result[0])
+            timestamps.append(result[1])
+
+    dt_list = [timestamps[i] - timestamps[i - 1] for i in range(1, len(timestamps))]
+
+    for frame, (nodes, dt) in enumerate(zip(nodes_list[1:], dt_list)):
+        output.append(
+            {
+                "nodes": nodes.tolist(),
+                "velocity": ((nodes - nodes_list[frame]) / dt).tolist(),
+                "dt": dt,
+                "frame": frame,
+            }
+        )
+
+    return np.array(output, dtype=object)
+
+
+if __name__ == "__main__":
+
+    a = [[1.1, -0.2], [0, 0], [0.7, 3.2]]
+    b = [[2.1, -3], [1.4, -0.2], [1.3, -0.4]]
+
+    # vid = cv.VideoCapture("media/vids/WhatsApp Video 2025-11-16 at 22.14.35.mp4")
+    # output = extract_nodes_from_video(vid, max_workers=16)
+
+    # np.save("output.npy", output)
+    array: np.ndarray = np.load("output.npy", allow_pickle=True)
+    array = np.array(array, dtype=object)
+
+    for i in range(len(array)):
+        array[i]["nodes"] = array[i]["nodes"].tolist()
+        array[i]["velocity"] = array[i]["velocity"].tolist()
+
+    array = list(array)  # type: ignore
+    with open("output.json", "w") as f:
+        json.dump(array, f, indent=2)
+    # print(output)
+    # # Check if camera opened successfully
+    # if vid.isOpened() is False:
+    #     print("Error opening video stream or file")
+
+    # # Read until video is completed
+    # while vid.isOpened():
+    #     # Capture frame-by-frame
+    #     ret, frame = vid.read()
+    #     if ret == True:
+
+    #         # Display the resulting frame
+    #         cv.imshow("Frame", frame)
+
+    #         # Press Q on keyboard to  exit
+    #         if cv.waitKey(25) & 0xFF == ord("q"):
+    #             break
+
+    #     # Break the loop
+    #     else:
+    #         break
+
+    # # When everything done, release the video capture object
+    # vid.release()
+
+    # img = cv.imread("media/imgs/rope.ppm", cv.IMREAD_GRAYSCALE)
+    # assert img is not None
+
+    # # --- Pre-thinning ---
+    # img_skeleton = preprocess_and_skeletonize(img)
+
+    # # --- Extract Path ---
+    # path = extract_clean_ordered_path(img_skeleton)
+
+    # # --- Resample to N Nodes ---
+    # n_nodes = 20  # Adjust based on your needs
+    # resampled_path = resample_path_to_n_nodes(path, n_nodes)
+
+    # # --- Visualize ---
+    # vis_img = cv.cvtColor(img_skeleton, cv.COLOR_GRAY2BGR)
+    # visualize_nodes(vis_img, resampled_path)
+
+    # cv.imshow("Resampled Nodes", vis_img)
+    # cv.waitKey(0)
+    # cv.destroyAllWindows()
