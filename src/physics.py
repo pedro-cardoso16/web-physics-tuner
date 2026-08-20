@@ -561,6 +561,61 @@ def torsion_spring_force(
     return central_force, outer_force_1, outer_force_2
 
 
+def make_torsion_spring_force(
+    central_particle: Particle,
+    outer_particle_1: Particle,
+    outer_particle_2: Particle,
+    theta0: float,
+    k: float,
+    epsilon: float = 1e-4,
+    **kwargs,
+) -> tuple[Constraint, Constraint, Constraint]:
+    ref = Reference(
+        central_particle=central_particle,
+        outer_particle_1=outer_particle_1,
+        outer_particle_2=outer_particle_2,
+        theta0=theta0,
+        k=k,
+        epsilon=epsilon,
+        **kwargs,
+    )
+
+    cache: dict[str, None | tuple] = {
+        "key": None,
+        "result": None,
+    }
+
+    def compute(cp, op1, op2, theta0, k, epsilon):
+        key = (cp.x.tobytes(), op1.x.tobytes(), op2.x.tobytes(), theta0, k, epsilon)
+        if key != cache["key"]:
+            cache["result"] = torsion_spring_force(
+                theta0, k, op1.x - cp.x, op2.x - cp.x, epsilon
+            )
+            cache["key"] = key
+        return cache["result"]
+
+    def make_wrapper(index: int):
+        def wrapper(**kwargs) -> np.ndarray:
+            cp = kwargs["central_particle"]
+            op1 = kwargs["outer_particle_1"]
+            op2 = kwargs["outer_particle_2"]
+            result = compute(
+                cp, op1, op2, kwargs["theta0"], kwargs["k"], kwargs["epsilon"]
+            )
+            if result is None:
+                return np.zeros(2)
+            
+            return result[index]
+
+        return wrapper
+
+    return (
+        Constraint(make_wrapper(0), reference=ref),
+        Constraint(make_wrapper(1), reference=ref),
+        Constraint(make_wrapper(2), reference=ref),
+    )
+
+
 def set_constraint(constraint_func: Callable, **kwargs) -> Constraint:
     reference = Reference()
 
