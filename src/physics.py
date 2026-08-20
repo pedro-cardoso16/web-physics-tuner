@@ -1,9 +1,9 @@
 import numpy as np
 import time
 import matplotlib.pyplot as plt
-from typing import Callable
+from typing import Callable, Literal
 from numpy.typing import ArrayLike, NDArray
-
+# from numba import vectorize
 
 class Reference:
     def __init__(self, **kwargs) -> None:
@@ -12,8 +12,8 @@ class Reference:
 
 
 class Constraint:
-    def __init__(self, func, reference: Reference) -> None:
-        self.func: Callable[[], float] = func
+    def __init__(self, func: Callable, reference: Reference) -> None:
+        self.func: Callable[[], float | np.ndarray] = func
         # self.target: Particle = target
         self.reference = reference
 
@@ -107,8 +107,21 @@ class Simulation:
         self.particles = particles
         self.dt = 0.001
 
+    @property
+    def particles(self) -> list[Particle]:
+        return self.__particles
+
+    @particles.setter
+    def particles(self, x: list[Particle]) -> None:
+        self.__particles = x
+        self.__build_vectorized_params()
+
+    def __build_vectorized_params(self) -> None:
         # Vectorized state arrays
+        particles = self.particles
+
         self.num_particles = len(particles)
+
         if self.num_particles > 0:
             self.pos = np.array([p.x for p in particles], dtype=np.float64)
             self.vel = np.array([p.v for p in particles], dtype=np.float64)
@@ -139,17 +152,97 @@ class Simulation:
         self.dampening_indices = np.array([], dtype=np.int32)
         self.dampening_k = np.array([], dtype=np.float64)
 
+        self.torsion_central_indices = np.array([], dtype=np.int32)
+        self.torsion_outer1_indices = np.array([], dtype=np.int32)
+        self.torsion_outer2_indices = np.array([], dtype=np.int32)
+        self.torsion_theta0 = np.array([], dtype=np.float64)
+        self.torsion_k = np.array([], dtype=np.float64)
+        self.torsion_epsilon = np.array([], dtype=np.float64)
+
+        self.rigid_owner_indices = np.array([], dtype=np.int32)
+        self.rigid_pivot_indices = np.array([], dtype=np.int32)
+        self.rigid_d_fixed = np.array([], dtype=np.float64)
+        self.rigid_dt = np.array([], dtype=np.float64)
+
+        self.rope_owner_indices = np.array([], dtype=np.int32)
+        self.rope_pivot_indices = np.array([], dtype=np.int32)
+        self.rope_d_max = np.array([], dtype=np.float64)
+        self.rope_dt = np.array([], dtype=np.float64)
+
     def build_vectorized_constraints(self) -> None:
         """Compiles individual Particle constraints into vectorized NumPy arrays."""
         e_owner, e_a, e_b, e_k, e_dr = [], [], [], [], []
         g_idx, g_vec = [], []
         d_idx, d_k = [], []
+        t_central, t_outer1, t_outer2, t_theta0, t_k, t_eps = [], [], [], [], [], []
+        r_owner, r_pivot, r_dfixed, r_dt = [], [], [], []
+        rope_owner, rope_pivot, rope_dmax, rope_dt = [], [], [], []
+        seen_torsion_refs: set[int] = set()
 
         for idx, p in enumerate(self.particles):
             for c in p.constraints:
                 ref = c.reference
-                # Check for elastic constraints
+
+                # Check for torsion spring constraints (checked first: the
+                # same `ref` is shared by all three Constraints of a joint,
+                # so dedupe by identity and only add each joint once)
                 if (
+                    hasattr(ref, "central_particle")
+                    and hasattr(ref, "outer_particle_1")
+                    and hasattr(ref, "outer_particle_2")
+                    and hasattr(ref, "theta0")
+                ):
+                    if id(ref) in seen_torsion_refs:
+                        continue
+                    try:
+                        c_idx = self.particles.index(ref.central_particle)
+                        o1_idx = self.particles.index(ref.outer_particle_1)
+                        o2_idx = self.particles.index(ref.outer_particle_2)
+                    except ValueError:
+                        continue
+                    seen_torsion_refs.add(id(ref))
+                    t_central.append(c_idx)
+                    t_outer1.append(o1_idx)
+                    t_outer2.append(o2_idx)
+                    t_theta0.append(getattr(ref, "theta0"))
+                    t_k.append(getattr(ref, "k"))
+                    t_eps.append(getattr(ref, "epsilon", 1e-4))
+
+
+                # Check for rigid connection constraints
+                elif (
+                    hasattr(ref, "particle")
+                    and hasattr(ref, "pivot_particle")
+                    and hasattr(ref, "d_fixed")
+                    and hasattr(ref, "dt")
+                ):
+                    try:
+                        pivot_idx = self.particles.index(ref.pivot_particle)
+                    except ValueError:
+                        continue
+                    r_owner.append(idx)
+                    r_pivot.append(pivot_idx)
+                    r_dfixed.append(getattr(ref, "d_fixed"))
+                    r_dt.append(getattr(ref, "dt"))
+
+                # Check for rope constraints
+                elif (
+                    hasattr(ref, "particle")
+                    and hasattr(ref, "pivot_particle")
+                    and hasattr(ref, "d_max")
+                    and hasattr(ref, "dt")
+                ):
+                    try:
+                        pivot_idx = self.particles.index(ref.pivot_particle)
+                    except ValueError:
+                        continue
+                    rope_owner.append(idx)
+                    rope_pivot.append(pivot_idx)
+                    rope_dmax.append(getattr(ref, "d_max"))
+                    rope_dt.append(getattr(ref, "dt"))
+
+                # Check for elastic constraints
+                elif (
                     hasattr(ref, "x1")
                     and hasattr(ref, "x2")
                     and hasattr(ref, "k")
@@ -161,9 +254,6 @@ class Simulation:
                         try:
                             x1_idx = self.particles.index(x1_attr)
                             x2_idx = self.particles.index(x2_attr)
-                            # The resulting force always applies to the
-                            # constraint's owner (idx) - regardless of
-                            # whether the owner happens to be x1 or x2.
                             e_owner.append(idx)
                             e_a.append(x1_idx)
                             e_b.append(x2_idx)
@@ -195,6 +285,23 @@ class Simulation:
 
         self.dampening_indices = np.array(d_idx, dtype=np.int32)
         self.dampening_k = np.array(d_k, dtype=np.float64)
+
+        self.torsion_central_indices = np.array(t_central, dtype=np.int32)
+        self.torsion_outer1_indices = np.array(t_outer1, dtype=np.int32)
+        self.torsion_outer2_indices = np.array(t_outer2, dtype=np.int32)
+        self.torsion_theta0 = np.array(t_theta0, dtype=np.float64)
+        self.torsion_k = np.array(t_k, dtype=np.float64)
+        self.torsion_epsilon = np.array(t_eps, dtype=np.float64)
+
+        self.rigid_owner_indices = np.array(r_owner, dtype=np.int32)
+        self.rigid_pivot_indices = np.array(r_pivot, dtype=np.int32)
+        self.rigid_d_fixed = np.array(r_dfixed, dtype=np.float64)
+        self.rigid_dt = np.array(r_dt, dtype=np.float64)
+
+        self.rope_owner_indices = np.array(rope_owner, dtype=np.int32)
+        self.rope_pivot_indices = np.array(rope_pivot, dtype=np.int32)
+        self.rope_d_max = np.array(rope_dmax, dtype=np.float64)
+        self.rope_dt = np.array(rope_dt, dtype=np.float64)
 
     def run(self, n: int | None = None) -> None:
         if self.num_particles == 0:
@@ -231,6 +338,46 @@ class Simulation:
                 )
                 np.add.at(net_forces, self.elastic_owner_indices, f_elastic)
 
+            if self.torsion_central_indices.size > 0:
+                central_forces, outer1_forces, outer2_forces = torsion_spring_force(
+                    self.torsion_theta0[:, np.newaxis],
+                    self.torsion_k[:, np.newaxis],
+                    self.pos[self.torsion_outer1_indices]
+                    - self.pos[self.torsion_central_indices],
+                    self.pos[self.torsion_outer2_indices]
+                    - self.pos[self.torsion_central_indices],
+                    self.torsion_epsilon[:, np.newaxis],
+                )
+
+                np.add.at(net_forces, self.torsion_central_indices, central_forces)
+                np.add.at(net_forces, self.torsion_outer1_indices, outer1_forces)
+                np.add.at(net_forces, self.torsion_outer2_indices, outer2_forces)
+
+
+            if self.rigid_owner_indices.size > 0:
+                f_rigid = rigid_connection_force(
+                    self.masses[self.rigid_owner_indices],
+                    self.pos[self.rigid_owner_indices],
+                    self.vel[self.rigid_owner_indices],
+                    self.pos[self.rigid_pivot_indices],
+                    self.vel[self.rigid_pivot_indices],
+                    self.rigid_d_fixed[:, np.newaxis],
+                    self.rigid_dt[:, np.newaxis],
+                )
+                np.add.at(net_forces, self.rigid_owner_indices, f_rigid)
+
+            if self.rope_owner_indices.size > 0:
+                f_rope = rope_force(
+                    self.masses[self.rope_owner_indices],
+                    self.pos[self.rope_owner_indices],
+                    self.vel[self.rope_owner_indices],
+                    self.pos[self.rope_pivot_indices],
+                    self.vel[self.rope_pivot_indices],
+                    self.rope_d_max[:, np.newaxis],
+                    self.rope_dt[:, np.newaxis],
+                )
+                np.add.at(net_forces, self.rope_owner_indices, f_rope)
+
             # 2. Vectorized acceleration: a = F / m
             self.acc = net_forces / self.masses
             self.acc[fixed_mask] = 0
@@ -251,10 +398,6 @@ class Simulation:
             particle.v = self.vel[idx]
             particle.a = self.acc[idx]
             particle.xp = self.prev_pos[idx]
-
-
-# constraint_list = []
-# particles: dict[str, Particle] = {}
 
 
 def elastic_force(
@@ -368,13 +511,13 @@ def make_dampening_constraint(particle: Particle, k: float) -> Constraint:
 
 
 def rigid_connection_force(
-    mass: float,
+    mass: float | np.ndarray,
     pos: np.ndarray,
     velocity: np.ndarray,
     pivot_pos: np.ndarray,
     pivot_velocity: np.ndarray,
-    d_fixed: float,
-    dt: float,
+    d_fixed: float | np.ndarray,
+    dt: float | np.ndarray,
 ) -> np.ndarray:
     """Rigid connection force
 
@@ -399,7 +542,7 @@ def rigid_connection_force(
             and pivot's positions and velocities.
     """
     future_rel_pos = (pos - pivot_pos) + dt * (velocity - pivot_velocity)
-    future_rel_pos_norm = np.linalg.norm(future_rel_pos)
+    future_rel_pos_norm = np.linalg.norm(future_rel_pos, axis=-1, keepdims=True)
     future_rel_pos_normalized = future_rel_pos / future_rel_pos_norm
 
     f = -(mass / dt**2) * (future_rel_pos_norm - d_fixed) * future_rel_pos_normalized
@@ -436,13 +579,13 @@ def make_rigid_connection_constraint(
 
 
 def rope_force(
-    mass: float,
+    mass: float | np.ndarray,
     pos: np.ndarray,
     velocity: np.ndarray,
     pivot_pos: np.ndarray,
     pivot_velocity: np.ndarray,
-    d_max: float,
-    dt: float,
+    d_max: float | np.ndarray,
+    dt: float | np.ndarray,
 ) -> np.ndarray:
     """Rope connection force
 
@@ -467,14 +610,16 @@ def rope_force(
             and pivot's positions and velocities.
     """
     future_rel_pos = (pos - pivot_pos) + dt * (velocity - pivot_velocity)
-    future_rel_pos_norm = np.linalg.norm(future_rel_pos)
+    future_rel_pos_norm = np.linalg.norm(future_rel_pos, axis=-1, keepdims=True)
 
-    if future_rel_pos_norm <= d_max:
-        return np.zeros_like(pos)
-
-    future_rel_pos_normalized = future_rel_pos / future_rel_pos_norm
+    # Row is "slack" (rope not taut) when within d_max, mask instead of `if`,
+    # same pattern as torsion_spring_force's `degenerate` mask.
+    slack = future_rel_pos_norm <= d_max
+    norm_safe = np.where(slack, 1.0, future_rel_pos_norm)  # avoid div-by-zero on slack rows
+    future_rel_pos_normalized = future_rel_pos / norm_safe
 
     f = -(mass / dt**2) * (future_rel_pos_norm - d_max) * future_rel_pos_normalized
+    f = np.where(slack, 0.0, f)
     return f
 
 
@@ -506,29 +651,51 @@ def make_rope_constraint(
 
 
 def torsion_spring_force(
-    theta0: float,   # Target angle in range [0, 2*pi]
-    k: float,        # Stiffness coefficient
-    v1: np.ndarray,  # Vector from Center to Node A (A - B)
-    v2: np.ndarray,  # Vector from Center to Node C (C - B)
-    epsilon: float = 1e-4  # Security threshold to avoid division by zero
+    theta0: float | np.ndarray,  # Target angle(s), shape (m,) or (m,1) or scalar
+    k: float | np.ndarray,  # Stiffness coefficient(s), shape (m,) or (m,1) or scalar
+    v1: np.ndarray,  # Vector(s) from Center to Node A, shape (m, 2) or (2,)
+    v2: np.ndarray,  # Vector(s) from Center to Node C, shape (m, 2) or (2,)
+    epsilon: float | np.ndarray = 1e-4,  # Security threshold, scalar or (m,)/(m,1)
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    
-    len1 = np.linalg.norm(v1)
-    len2 = np.linalg.norm(v2)
-    if len1 < epsilon or len2 < epsilon:
-        return np.zeros(2), np.zeros(2), np.zeros(2)
-        
-    v1_normalized = v1 / len1
-    v2_normalized = v2 / len2
+    # Normalize everything to 2D batched form; remember if input was a single
+    # joint (1D vectors) so we can squeeze the output back to match.
+    single_joint = np.ndim(v1) == 1
 
-    # 1. Native NumPy dot and cross products for 2D angle tracking
-    dot_product = np.dot(v1_normalized, v2_normalized)
-    cross_product = np.cross(v1_normalized, v2_normalized)
-    
-    # Compute true counter-clockwise angle in range [0, 2*pi]
-    theta = np.arctan2(cross_product, dot_product)
-    if theta < 0:
-        theta += 2 * np.pi
+    v1 = np.atleast_2d(np.asarray(v1, dtype=np.float64))
+    v2 = np.atleast_2d(np.asarray(v2, dtype=np.float64))
+    m = v1.shape[0]
+
+    theta0 = np.broadcast_to(
+        np.asarray(theta0, dtype=np.float64).reshape(-1, 1), (m, 1)
+    )
+    k = np.broadcast_to(np.asarray(k, dtype=np.float64).reshape(-1, 1), (m, 1))
+    epsilon = np.broadcast_to(
+        np.asarray(epsilon, dtype=np.float64).reshape(-1, 1), (m, 1)
+    )
+
+    len1 = np.linalg.norm(v1, axis=1, keepdims=True)
+    len2 = np.linalg.norm(v2, axis=1, keepdims=True)
+
+    # Rows where either segment is degenerate (too short) get zero force.
+    degenerate = (len1 < epsilon) | (len2 < epsilon)
+
+    # Safe denominators (avoid div-by-zero warnings on degenerate rows;
+    # those rows get masked to zero at the end regardless).
+    len1_safe = np.where(len1 < epsilon, 1.0, len1)
+    len2_safe = np.where(len2 < epsilon, 1.0, len2)
+
+    v1_normalized = v1 / len1_safe
+    v2_normalized = v2 / len2_safe
+
+    # 1. Dot and 2D "cross" (z-component only) products, per row
+    dot_product = np.sum(v1_normalized * v2_normalized, axis=1, keepdims=True)
+    cross_z = (
+        v1_normalized[:, 0] * v2_normalized[:, 1]
+        - v1_normalized[:, 1] * v2_normalized[:, 0]
+    ).reshape(-1, 1)
+    # Matches original: np.linalg.norm of a cross product with only a z
+    # component equals abs(cross_z), so theta stays in [0, pi] just as before.
+    theta = np.arctan2(np.abs(cross_z), dot_product)
 
     # 2. Linear delta theta calculation
     delta_theta = theta - theta0
@@ -536,32 +703,43 @@ def torsion_spring_force(
 
     # 3. Central Force Vector along the bisector
     bisector = v1_normalized + v2_normalized
-    bisector_len = np.linalg.norm(bisector)
+    bisector_len = np.linalg.norm(bisector, axis=1, keepdims=True)
+    bisector_degenerate = bisector_len < epsilon
+    bisector_len_safe = np.where(bisector_degenerate, 1.0, bisector_len)
 
-    if bisector_len < epsilon:
-        # Fallback if segments are completely opposite (180 degrees)
-        direction = np.array([-v1_normalized[1], v1_normalized[0]])
-    else:
-        direction = bisector / bisector_len
+    fallback_direction = np.column_stack(
+        [-v1_normalized[:, 1], v1_normalized[:, 0]]
+    )
+    direction = np.where(
+        bisector_degenerate, fallback_direction, bisector / bisector_len_safe
+    )
 
-    # Central restoring force vector
     central_magnitude = 2 * k * delta_theta * np.cos(delta_theta / 2)
     central_force = -delta_theta_sign * central_magnitude * direction
 
     # 4. Outer Forces perpendicular to their respective segments
-    v1_perpendicular = np.array([-v1_normalized[1], v1_normalized[0]])
-    v2_perpendicular = np.array([v2_normalized[1], -v2_normalized[0]])
+    v1_perpendicular = np.column_stack(
+        [-v1_normalized[:, 1], v1_normalized[:, 0]]
+    )
+    v2_perpendicular = np.column_stack(
+        [v2_normalized[:, 1], -v2_normalized[:, 0]]
+    )
 
-    # Scale with 1/length to maintain proper torque leverage
     torque_scalar = delta_theta_sign * k * delta_theta
-    
-    outer_force_1 = (torque_scalar / len1) * v1_perpendicular
-    outer_force_2 = (torque_scalar / len2) * v2_perpendicular
+    outer_force_1 = (torque_scalar / len1_safe) * v1_perpendicular
+    outer_force_2 = (torque_scalar / len2_safe) * v2_perpendicular
+
+    # Zero out degenerate rows across all three outputs
+    central_force = np.where(degenerate, 0.0, central_force)
+    outer_force_1 = np.where(degenerate, 0.0, outer_force_1)
+    outer_force_2 = np.where(degenerate, 0.0, outer_force_2)
+
+    if single_joint:
+        return central_force[0], outer_force_1[0], outer_force_2[0]
 
     return central_force, outer_force_1, outer_force_2
 
-
-def make_torsion_spring_force(
+def make_torsion_spring_constraint(
     central_particle: Particle,
     outer_particle_1: Particle,
     outer_particle_2: Particle,
@@ -604,7 +782,7 @@ def make_torsion_spring_force(
             )
             if result is None:
                 return np.zeros(2)
-            
+
             return result[index]
 
         return wrapper
@@ -643,6 +821,21 @@ def stromer(x: NDArray, xp: NDArray, a: NDArray, dt: float) -> np.ndarray:
     return xn
 
 
+def randomize_particle_property(
+    particle: Particle,
+    property: str,
+    r: float,
+    dx: list | np.ndarray | None = None,
+    dy: list | np.ndarray | None = None,
+) -> None:
+    theta = 2 * np.pi * np.random.rand()
+    p = getattr(particle, property)
+    p += r * np.array([np.cos(theta), np.sin(theta)])
+
+    if property == "x":
+        particle.xp = particle.x.copy()
+
+
 def main() -> None:
 
     # Create the particles:
@@ -679,7 +872,7 @@ def main() -> None:
         xt.append(particle2.x[0])
         yt.append(particle2.x[1])
 
-        print(round(end_time - start_time, 2), end="                 \r")
+        print(round(end_time - start_time, 2), end=20 * " " + "\r")
         if (end_time - start_time) > 100:
             break
 
