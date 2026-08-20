@@ -257,7 +257,7 @@ def resample_path_to_n_nodes(path: np.ndarray, n_nodes: int) -> np.ndarray:
     return np.array(resampled_path, dtype=np.float32)
 
 
-def visualize_nodes(vis_img, resampled_path, node_radius=4) -> None:
+def visualize_nodes(vis_img, resampled_path: np.ndarray, node_radius=4) -> None:
     """Draw resampled nodes on the visualization image."""
     for i, (x, y) in enumerate(resampled_path):
         # Draw node
@@ -340,8 +340,11 @@ def extract_info_from_image(
 
 
 def extract_nodes_from_video(
-    vid: cv.VideoCapture | str, n_nodes: int = 20, max_workers: int | None = None
-) -> np.ndarray:
+    vid: cv.VideoCapture | str,
+    n_nodes: int = 20,
+    max_workers: int | None = None,
+    save_to_file: str | None = None,
+) -> dict[str, dict[str, int] | list[dict[str, list[list[int | float]] | float | int]]]:
     if isinstance(vid, str):
         vid = cv.VideoCapture(vid)
 
@@ -389,7 +392,39 @@ def extract_nodes_from_video(
             }
         )
 
-    return np.array(output, dtype=object)
+    output = {
+        "resolution": {
+            "width": int(vid.get(cv.CAP_PROP_FRAME_WIDTH)),
+            "height": int(vid.get(cv.CAP_PROP_FRAME_HEIGHT)),
+        },
+        "frames": output[:],
+    }
+
+    if save_to_file is not None:
+        with open(save_to_file, "w") as f:
+            json.dump(output, f, indent=2)
+
+    return output
+
+
+def visualize_nodes_in_video(fp: str):
+    with open(fp) as f:
+        data = json.load(f)
+        resolution = data["resolution"]
+        # OpenCV uses (height, width) for numpy arrays, and needs BGR for colored circles
+        img_black = np.zeros((resolution["height"], resolution["width"], 3), dtype=np.uint8)
+
+        for frame in data['frames']:
+            vis_img = img_black.copy()
+            visualize_nodes(vis_img, np.array(frame['nodes']))
+
+            cv.imshow("Resampled Nodes", vis_img)
+            # Wait 30ms between frames to simulate a video
+            if cv.waitKey(30) & 0xFF == ord('q'):
+                break
+        cv.destroyAllWindows()
+
+    # black_image
 
 
 if __name__ == "__main__":
@@ -398,19 +433,23 @@ if __name__ == "__main__":
     b = [[2.1, -3], [1.4, -0.2], [1.3, -0.4]]
 
     # vid = cv.VideoCapture("media/vids/WhatsApp Video 2025-11-16 at 22.14.35.mp4")
-    # output = extract_nodes_from_video(vid, max_workers=16)
+    # output = extract_nodes_from_video(vid)
+
+    # with open("output.json", "w") as f:
+    #     json.dump(output, f, indent=2)
+
+    visualize_nodes_in_video("output.json")
 
     # np.save("output.npy", output)
-    array: np.ndarray = np.load("output.npy", allow_pickle=True)
-    array = np.array(array, dtype=object)
+    # array: np.ndarray = np.load("output.npy", allow_pickle=True)
+    # array = np.array(array, dtype=object)
 
-    for i in range(len(array)):
-        array[i]["nodes"] = array[i]["nodes"].tolist()
-        array[i]["velocity"] = array[i]["velocity"].tolist()
+    # for i in range(len(array)):
+    #     array[i]["nodes"] = array[i]["nodes"].tolist()
+    #     array[i]["velocity"] = array[i]["velocity"].tolist()
 
-    array = list(array)  # type: ignore
-    with open("output.json", "w") as f:
-        json.dump(array, f, indent=2)
+    # array = list(array)  # type: ignore
+
     # print(output)
     # # Check if camera opened successfully
     # if vid.isOpened() is False:
