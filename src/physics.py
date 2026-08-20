@@ -505,6 +505,62 @@ def make_rope_constraint(
     return Constraint(rope_wrapper, reference=ref)
 
 
+def torsion_spring_force(
+    theta0: float,   # Target angle in range [0, 2*pi]
+    k: float,        # Stiffness coefficient
+    v1: np.ndarray,  # Vector from Center to Node A (A - B)
+    v2: np.ndarray,  # Vector from Center to Node C (C - B)
+    epsilon: float = 1e-4  # Security threshold to avoid division by zero
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    
+    len1 = np.linalg.norm(v1)
+    len2 = np.linalg.norm(v2)
+    if len1 < epsilon or len2 < epsilon:
+        return np.zeros(2), np.zeros(2), np.zeros(2)
+        
+    v1_normalized = v1 / len1
+    v2_normalized = v2 / len2
+
+    # 1. Native NumPy dot and cross products for 2D angle tracking
+    dot_product = np.dot(v1_normalized, v2_normalized)
+    cross_product = np.cross(v1_normalized, v2_normalized)
+    
+    # Compute true counter-clockwise angle in range [0, 2*pi]
+    theta = np.arctan2(cross_product, dot_product)
+    if theta < 0:
+        theta += 2 * np.pi
+
+    # 2. Linear delta theta calculation
+    delta_theta = theta - theta0
+    delta_theta_sign = np.sign(delta_theta)
+
+    # 3. Central Force Vector along the bisector
+    bisector = v1_normalized + v2_normalized
+    bisector_len = np.linalg.norm(bisector)
+
+    if bisector_len < epsilon:
+        # Fallback if segments are completely opposite (180 degrees)
+        direction = np.array([-v1_normalized[1], v1_normalized[0]])
+    else:
+        direction = bisector / bisector_len
+
+    # Central restoring force vector
+    central_magnitude = 2 * k * delta_theta * np.cos(delta_theta / 2)
+    central_force = -delta_theta_sign * central_magnitude * direction
+
+    # 4. Outer Forces perpendicular to their respective segments
+    v1_perpendicular = np.array([-v1_normalized[1], v1_normalized[0]])
+    v2_perpendicular = np.array([v2_normalized[1], -v2_normalized[0]])
+
+    # Scale with 1/length to maintain proper torque leverage
+    torque_scalar = delta_theta_sign * k * delta_theta
+    
+    outer_force_1 = (torque_scalar / len1) * v1_perpendicular
+    outer_force_2 = (torque_scalar / len2) * v2_perpendicular
+
+    return central_force, outer_force_1, outer_force_2
+
+
 def set_constraint(constraint_func: Callable, **kwargs) -> Constraint:
     reference = Reference()
 
