@@ -40,6 +40,7 @@ class Particle:
         )  # current acceleration
         self.f: np.ndarray = np.zeros_like(self.x)
         self.xp: np.ndarray | None = None
+        self.vp: np.ndarray = self.v.copy()
 
         self.constraints: list[Constraint] = []
 
@@ -66,6 +67,7 @@ class Particle:
         return a
 
     def compute_velocity(self, dt) -> np.ndarray:
+        self.vp[:] = self.v[:]
         self.v[:] = (self.x - self.xp) / dt
 
         return self.v
@@ -773,7 +775,7 @@ def make_torsion_spring_constraint(
         return cache["result"]
 
     def make_wrapper(index: int):
-        def wrapper(**kwargs) -> np.ndarray:
+        def torsion_spring_wrapper(**kwargs) -> np.ndarray:
             cp = kwargs["central_particle"]
             op1 = kwargs["outer_particle_1"]
             op2 = kwargs["outer_particle_2"]
@@ -785,7 +787,7 @@ def make_torsion_spring_constraint(
 
             return result[index]
 
-        return wrapper
+        return torsion_spring_wrapper
 
     return (
         Constraint(make_wrapper(0), reference=ref),
