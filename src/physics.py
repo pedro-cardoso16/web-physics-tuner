@@ -129,7 +129,7 @@ class Simulation:
             self.vel = np.array([p.v for p in particles], dtype=np.float64)
             self.acc = np.array([p.a for p in particles], dtype=np.float64)
             self.prev_pos = np.array(
-                [p.xp if p.xp is not None else p.x for p in particles], dtype=np.float64
+                [p.xp if p.xp is not None else (p.x - p.v * self.dt) for p in particles], dtype=np.float64
             )
             self.masses = np.array([p.m for p in particles], dtype=np.float64).reshape(
                 -1, 1
