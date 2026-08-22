@@ -106,8 +106,8 @@ class Particle:
 
 class Simulation:
     def __init__(self, particles: list[Particle] = []) -> None:
-        self.particles = particles
         self.dt = 0.001
+        self.particles = particles
 
     @property
     def particles(self) -> list[Particle]:
@@ -127,6 +127,7 @@ class Simulation:
         if self.num_particles > 0:
             self.pos = np.array([p.x for p in particles], dtype=np.float64)
             self.vel = np.array([p.v for p in particles], dtype=np.float64)
+            self.prev_vel = np.array([p.vp for p in particles], dtype=np.float64)
             self.acc = np.array([p.a for p in particles], dtype=np.float64)
             self.prev_pos = np.array(
                 [p.xp if p.xp is not None else (p.x - p.v * self.dt) for p in particles], dtype=np.float64
@@ -137,6 +138,7 @@ class Simulation:
         else:
             self.pos = np.array([], dtype=np.float64)
             self.vel = np.array([], dtype=np.float64)
+            self.prev_vel = np.array([], dtype=np.float64)
             self.acc = np.array([], dtype=np.float64)
             self.prev_pos = np.array([], dtype=np.float64)
             self.masses = np.array([], dtype=np.float64)
@@ -390,6 +392,7 @@ class Simulation:
             self.pos = next_pos
 
             # 4. Vectorized velocity: v = (x - xp) / dt
+            self.prev_vel = self.vel.copy()
             self.vel = (self.pos - self.prev_pos) / self.dt
 
             i += 1
@@ -398,6 +401,7 @@ class Simulation:
         for idx, particle in enumerate(self.particles):
             particle.x = self.pos[idx]
             particle.v = self.vel[idx]
+            particle.vp = self.prev_vel[idx]
             particle.a = self.acc[idx]
             particle.xp = self.prev_pos[idx]
 
