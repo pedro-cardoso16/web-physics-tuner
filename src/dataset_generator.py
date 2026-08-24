@@ -2,6 +2,7 @@ import numpy as np
 import sys
 import pandas as pd
 from tools import rotate_particles
+from pathlib import Path
 
 # from copy import deepcopy
 import json
@@ -36,7 +37,7 @@ def extract_nodes_properties(simulation: Simulation):
         target = particles[i].x
 
         dt = simulation.dt
-        forces_hyperparams = []
+        forces_hyperparams = {}
 
         for c in particles[i].constraints:
             variables = vars(c.reference).copy()
@@ -69,7 +70,7 @@ def extract_nodes_properties(simulation: Simulation):
                     except:
                         pass
 
-            forces_hyperparams.append({force_type: variables})
+            forces_hyperparams[force_type] = variables
 
         data.append(
             {
@@ -86,10 +87,14 @@ def execution(seed=None, **kwargs):
     simulation = Simulation()
     rng = np.random.default_rng(seed=seed)
 
-    n_nodes = rng.integers(1, 101, dtype=int)
+    n_nodes = rng.integers(3, 103, dtype=int)
     anchor_point = rng.integers((0, 0), (500, 200))
-    step = rng.uniform(0, 100)
-    k = rng.uniform(0, 100)
+    step = rng.uniform(1, 201)  # base distance between consecutive nodes
+    k = rng.uniform(1, 501)
+    dampening_k = rng.uniform(1, 101)
+    g = rng.uniform(100, 600)
+    torsion_k = rng.uniform(0, 500)
+    angle_deg = rng.uniform(0, 2 * np.pi)
 
     particles = create_curling_string(
         simulation,
@@ -97,10 +102,14 @@ def execution(seed=None, **kwargs):
         n=n_nodes,
         step=step,
         k=k,
-        theta0=np.deg2rad(20),
-        torsion_k=100,
-        dr=20,
+        theta0=angle_deg,
+        torsion_k=torsion_k,
+        dr=step,
+        g=np.array([0, g]),
+        dampening=dampening_k,
     )
+
+    rotate_particles(*particles, pivot=particles[0].x, angle_rad=rng.uniform(0, np.pi))
 
     simulation.particles = particles
     simulation.build_vectorized_constraints()
@@ -143,64 +152,129 @@ def execution(seed=None, **kwargs):
                 p["target"][i] /= r
                 p["input"]["v"][i] /= r
 
-        p["input"]["n"] = (p["input"]["n"] - 1) / 100
+        p["input"]["n"] = (p["input"]["n"] - 3) / 100
+
+        for key in p["forces_hyperparams"].keys():
+            k = p["forces_hyperparams"][key]
+            match key:
+                case "elastic_force":
+                    k["k"] = (k["k"] - 1) / 500
+                    k["dr"] = (k["dr"] - 1) / 200
+                case "torsion_spring_outer_1":
+                    k["k"] /= 500
+                    k["theta0"] /= 2 * np.pi
+                case "torsion_spring_central":
+                    k["k"] /= 500
+                    k["theta0"] /= 2 * np.pi
+                case "torsion_spring_outer_2":
+                    k["k"] /= 500
+                    k["theta0"] /= 2 * np.pi
+                case "dampening_force":
+                    k["k"] = (k["k"] - 1) / 100
+                case "gravitational_force":
+                    k["g"][1] = (k["g"][1] - 100) / 500
 
     return data
+
+
+# def generate_dataset(
+#     file_path: str | None = None,
+#     seed: int | None = None,
+#     n_simulations: int = 50,
+#     normalize: bool = True,
+#     **kwargs,
+# ):
+#     data = []
+#     futures = []
+
+#     rng = np.random.default_rng(seed)
+
+#     with ProcessPoolExecutor(kwargs.get("max_workers", None)) as executor:
+#         for _ in range(n_simulations):
+#             simulation_seed = rng.integers(0, sys.maxsize)
+
+#             future = executor.submit(
+#                 execution,
+#                 **{
+#                     "seed": simulation_seed,
+#                     "n_iterations": kwargs.get("n_iterations", 50),
+#                 },
+#             )
+
+#             futures.append(future)
+
+#         position = 0
+
+#         for future in tqdm(
+#             as_completed(futures),
+#             desc="Generating synthetic dataset",
+#             total=len(futures),
+#             position=position,
+#             unit="simulations",
+#         ):
+#             data.extend(future.result())
+#             position += 1
+
+#     if file_path is not None:
+#         write_large_json(data, file_path)
+
+#     return data
+
+
+# def write_large_json(data, filepath, chunk_size=50000):
+#     with open(filepath, "w", encoding="utf-8") as f:
+#         f.write("[\n")
+#         n = len(data)
+#         for i in tqdm(
+#             range(0, n, chunk_size), desc="Writing to json file", unit="chunk"
+#         ):
+#             chunk = data[i : i + chunk_size]
+#             f.write(",\n".join(map(json.dumps, chunk)))
+#             # separate this chunk from the next one; skip after the last chunk
+#             if i + chunk_size < n:
+#                 f.write(",\n")
+#             else:
+#                 f.write("\n")
+#         f.write("]\n")
 
 
 def generate_dataset(
-    file_path: str | None = None,
+    shard_dir: str,
     seed: int | None = None,
     n_simulations: int = 50,
-    normalize: bool = True,
     **kwargs,
 ):
-    data = []
-    futures = []
-
+    Path(shard_dir).mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
+    manifest = []
 
     with ProcessPoolExecutor(kwargs.get("max_workers", None)) as executor:
-        for _ in range(n_simulations):
+        futures = {}
+        for sim_idx in range(n_simulations):
             simulation_seed = rng.integers(0, sys.maxsize)
-
             future = executor.submit(
                 execution,
-                **{
-                    "seed": simulation_seed,
-                    "n_iterations": kwargs.get("n_iterations", 50),
-                },
+                **{"seed": simulation_seed, "n_iterations": kwargs.get("n_iterations", 50)},
             )
-
-            futures.append(future)
-
-        position = 0
+            futures[future] = sim_idx
 
         for future in tqdm(
-            as_completed(futures),
-            desc="Generating synthetic dataset",
-            total=len(futures),
-            position=position,
+            as_completed(futures), desc="Generating synthetic dataset", total=len(futures)
         ):
-            data.extend(future.result())
-            position += 1
+            sim_idx = futures[future]
+            records = future.result()  # only THIS simulation's records in memory
 
-    if file_path is not None:
-        write_large_json(data, file_path)
+            shard_path = Path(shard_dir) / f"sim_{sim_idx:06d}.json"
+            with open(shard_path, "w", encoding="utf-8") as f:
+                json.dump(records, f)
 
-    return data
+            manifest.append({"shard": shard_path.name, "n_records": len(records)})
+            # `records` goes out of scope next loop iteration and gets GC'd
 
-
-def write_large_json(data, filepath, chunk_size=50000):
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write("[\n")
-        for i in tqdm(
-            range(0, len(data), chunk_size), desc="Writing to json file", unit="chunk"
-        ):
-            chunk = data[i : i + chunk_size]
-            f.write(",\n".join(map(json.dumps, chunk)) + "\n")
-        f.write("]\n")
+    with open(Path(shard_dir) / "manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
 
 
 if __name__ == "__main__":
-    generate_dataset("data/train_data.json", 15, 5)
+    generate_dataset("data/shards", seed=1, n_simulations=10, n_iterations=5)
+
