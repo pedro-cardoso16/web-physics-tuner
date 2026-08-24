@@ -12,6 +12,7 @@
 - [x] JSON export system
 - [ ] Simulation parameters: gravity, elastic/dampening forces, mass
 - [ ] Data loaders for train/test pipelines
+- [ ] Normalize all the required data
 
 ## Optics & Object Tracking
 - [x] Blur filter for noise reduction
@@ -24,4 +25,6 @@
 - [ ] Model to predict next positions based on current state and $\theta$ parameters
 - [ ] Train on synthetic data
 
-
+- [x] Set the normalization setup
+- [ ] Generate final dataset
+- [ ] Focus on the NN architecture
