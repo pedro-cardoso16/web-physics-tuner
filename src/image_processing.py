@@ -11,6 +11,7 @@ import numpy as np
 import networkx as nx
 import json
 
+from functools import partial
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from numpy.typing import ArrayLike
@@ -38,8 +39,8 @@ def extract_outline_values(img: MatLike, width: int = 1) -> MatLike:
     return cv.Mat(output)
 
 
-def convert_to_binary(img: MatLike, thresh: int) -> MatLike:
-    _, img_binary = cv.threshold(img, thresh, 255, cv.THRESH_BINARY_INV)
+def convert_to_binary(img: MatLike, thresh: int, invert: bool = True) -> MatLike:
+    _, img_binary = cv.threshold(img, thresh, 255, cv.THRESH_BINARY_INV if invert else cv.THRESH_BINARY)
     return img_binary
 
 
@@ -344,6 +345,8 @@ def extract_nodes_from_video(
     n_nodes: int = 20,
     max_workers: int | None = None,
     save_to_file: str | None = None,
+    thresh: int | None = None,
+    anchor_pt: np.ndarray | None = None,
 ) -> dict[str, dict[str, int] | list[dict[str, list[list[int | float]] | float | int]]]:
     if isinstance(vid, str):
         vid = cv.VideoCapture(vid)
@@ -370,8 +373,9 @@ def extract_nodes_from_video(
     timestamps = []
 
     with ProcessPoolExecutor(max_workers) as executor:
-
-        results = executor.map(extract_info_from_image, frame_generator())
+        # Use partial to pre-configure n_nodes and thresh for each parallel worker
+        worker_func = partial(extract_info_from_image, n_nodes=n_nodes, thresh=thresh, anchor_pt=anchor_pt)
+        results = executor.map(worker_func, frame_generator())
 
         for result in tqdm(results, total=total_frames, desc="Processing Frames"):
             if result is None:
@@ -407,38 +411,90 @@ def extract_nodes_from_video(
     return output
 
 
-def visualize_nodes_in_video(fp: str):
+def visualize_nodes_in_video(fp: str, original_video: str | None = None):
     with open(fp) as f:
         data = json.load(f)
-        resolution = data["resolution"]
-        # OpenCV uses (height, width) for numpy arrays, and needs BGR for colored circles
-        img_black = np.zeros((resolution["height"], resolution["width"], 3), dtype=np.uint8)
+    
+    resolution = data["resolution"]
+    target_w, target_h = resolution["width"], resolution["height"]
+    
+    cap = None
+    if original_video is not None:
+        cap = cv.VideoCapture(original_video)
+        if not cap.isOpened():
+            print(f"Warning: Could not open original video '{original_video}'.")
+            cap = None
 
-        for frame in data['frames']:
-            vis_img = img_black.copy()
-            visualize_nodes(vis_img, np.array(frame['nodes']))
+    img_black = np.zeros((target_h, target_w, 3), dtype=np.uint8)
 
-            cv.imshow("Resampled Nodes", vis_img)
-            # Wait 30ms between frames to simulate a video
-            if cv.waitKey(30) & 0xFF == ord('q'):
+    # -------------------------------------------------------------
+    # 1. CONFIGURE WINDOW HERE
+    # -------------------------------------------------------------
+    # This enables manual dragging and programmatic resizing
+    cv.namedWindow("Overlay Nodes", cv.WINDOW_NORMAL)
+    
+    # Optional: Force the window to start at a specific size (e.g., 960x540)
+    # cv.resizeWindow("Overlay Nodes", 960, 540)
+    # -------------------------------------------------------------
+
+    try:
+        for frame_data in data["frames"]:
+            vis_img = None
+            if cap is not None:
+                ret, frame = cap.read()
+                if ret:
+                    if frame.shape[1] != target_w or frame.shape[0] != target_h:
+                        vis_img = cv.resize(frame, (target_w, target_h))
+                    else:
+                        vis_img = frame.copy()
+            
+            if vis_img is None:
+                vis_img = img_black.copy()
+
+            visualize_nodes(vis_img, np.array(frame_data["nodes"]))
+
+            # Show frame inside the pre-declared normal window
+            cv.imshow("Overlay Nodes", vis_img)
+            
+            if cv.waitKey(30) & 0xFF == ord("q"):
                 break
+    finally:
+        if cap is not None:
+            cap.release()
         cv.destroyAllWindows()
-
-    # black_image
 
 
 if __name__ == "__main__":
+    vid = cv.VideoCapture("media/vids/demo_3.mp4")
+    # ret, frame = vid.read()
+    # frame = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+    # cv.imshow("bw_frame", frame)
 
-    a = [[1.1, -0.2], [0, 0], [0.7, 3.2]]
-    b = [[2.1, -3], [1.4, -0.2], [1.3, -0.4]]
+    thresh = 80
+    # frame = preprocess_and_skeletonize(frame, thresh=thresh)
 
-    # vid = cv.VideoCapture("media/vids/WhatsApp Video 2025-11-16 at 22.14.35.mp4")
-    # output = extract_nodes_from_video(vid)
+    # Blurring for salt-and-pepper noise removal
+    # img_blurred = cv.medianBlur(frame, 5)
+
+    # if thresh is None:
+    #     thresh = np.mean(np.array(extract_outline_values(img_blurred, 3))) - 10
+
+    # Binary conversion
+    # img_binary = convert_to_binary(frame, thresh)
+
+    # # nodes = extract_nodes_from_image(frame)
+
+    # cv.namedWindow("Frame", cv.WINDOW_NORMAL)
+    # # visualize_nodes(frame, nodes)
+    # cv.imshow("Frame", img_binary)
+    # cv.waitKey(0)
+    # cv.destroyAllWindows()
+    output = extract_nodes_from_video(vid, save_to_file="output.json", thresh=147, anchor_pt=np.array([500,0]))
 
     # with open("output.json", "w") as f:
     #     json.dump(output, f, indent=2)
 
-    visualize_nodes_in_video("output.json")
+    visualize_nodes_in_video("output.json", "media/vids/demo_3.mp4")
 
     # np.save("output.npy", output)
     # array: np.ndarray = np.load("output.npy", allow_pickle=True)

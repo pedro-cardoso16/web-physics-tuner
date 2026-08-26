@@ -38,6 +38,7 @@ def extract_nodes_properties(simulation: Simulation):
 
         dt = simulation.dt
         forces_hyperparams = {}
+        elastic_count = 1  # Distinguish consecutive elastic constraints for the same node
 
         for c in particles[i].constraints:
             variables = vars(c.reference).copy()
@@ -57,6 +58,11 @@ def extract_nodes_properties(simulation: Simulation):
                 force_type += "_outer_1"
             elif particles[i] == outer_particle_2:
                 force_type += "_outer_2"
+
+            # Assign sequential labels to multiple elastic connections (e.g., top and bottom)
+            if force_type == "elastic_force":
+                force_type = f"elastic_force_{elastic_count}"
+                elastic_count += 1
 
             for key, val in variables.items():
                 if isinstance(val, np.ndarray):
@@ -157,7 +163,7 @@ def execution(seed=None, **kwargs):
         for key in p["forces_hyperparams"].keys():
             k = p["forces_hyperparams"][key]
             match key:
-                case "elastic_force":
+                case "elastic_force_1" | "elastic_force_2":
                     k["k"] = (k["k"] - 1) / 500
                     k["dr"] = (k["dr"] - 1) / 200
                 case "torsion_spring_outer_1":
@@ -175,67 +181,6 @@ def execution(seed=None, **kwargs):
                     k["g"][1] = (k["g"][1] - 100) / 500
 
     return data
-
-
-# def generate_dataset(
-#     file_path: str | None = None,
-#     seed: int | None = None,
-#     n_simulations: int = 50,
-#     normalize: bool = True,
-#     **kwargs,
-# ):
-#     data = []
-#     futures = []
-
-#     rng = np.random.default_rng(seed)
-
-#     with ProcessPoolExecutor(kwargs.get("max_workers", None)) as executor:
-#         for _ in range(n_simulations):
-#             simulation_seed = rng.integers(0, sys.maxsize)
-
-#             future = executor.submit(
-#                 execution,
-#                 **{
-#                     "seed": simulation_seed,
-#                     "n_iterations": kwargs.get("n_iterations", 50),
-#                 },
-#             )
-
-#             futures.append(future)
-
-#         position = 0
-
-#         for future in tqdm(
-#             as_completed(futures),
-#             desc="Generating synthetic dataset",
-#             total=len(futures),
-#             position=position,
-#             unit="simulations",
-#         ):
-#             data.extend(future.result())
-#             position += 1
-
-#     if file_path is not None:
-#         write_large_json(data, file_path)
-
-#     return data
-
-
-# def write_large_json(data, filepath, chunk_size=50000):
-#     with open(filepath, "w", encoding="utf-8") as f:
-#         f.write("[\n")
-#         n = len(data)
-#         for i in tqdm(
-#             range(0, n, chunk_size), desc="Writing to json file", unit="chunk"
-#         ):
-#             chunk = data[i : i + chunk_size]
-#             f.write(",\n".join(map(json.dumps, chunk)))
-#             # separate this chunk from the next one; skip after the last chunk
-#             if i + chunk_size < n:
-#                 f.write(",\n")
-#             else:
-#                 f.write("\n")
-#         f.write("]\n")
 
 
 def generate_dataset(
@@ -276,5 +221,4 @@ def generate_dataset(
 
 
 if __name__ == "__main__":
-    generate_dataset("data/shards", seed=1, n_simulations=10, n_iterations=5)
-
+    generate_dataset("data/shards", seed=1, n_simulations=1, n_iterations=400)
