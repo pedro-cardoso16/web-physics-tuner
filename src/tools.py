@@ -22,8 +22,12 @@ def rotate_particles(*args: Particle, pivot: np.ndarray, angle_rad: float) -> No
 
 
 def normalize_data_for_neural_net(file: str, output_file: str, **kwargs):
-
-    default_kwargs = {"dt_min": 0.001, "dt_max": 0.02}
+    default_kwargs = {
+        "dt_min": 0.001,
+        "dt_max": 0.02,
+        "n_nodes_max": 103,
+        "n_nodes_min": 3,
+    }
     kwargs = default_kwargs | kwargs
 
     with open(file) as f:
@@ -54,7 +58,9 @@ def normalize_data_for_neural_net(file: str, output_file: str, **kwargs):
         frame_data["dt"] = (frame_data["dt"] - kwargs["dt_min"]) / (
             kwargs["dt_max"] - kwargs["dt_min"]
         )
-
+    output_data["n_nodes"] = (n_nodes - kwargs["n_nodes_min"]) / (
+        kwargs["n_nodes_max"] - kwargs["n_nodes_min"]
+    )
     with open(output_file, "w") as f:
         json.dump(output_data, f)
 

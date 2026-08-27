@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
-
 HP_KEYS = (
     "g",
     "dampening_k",
@@ -99,11 +98,11 @@ def pick_shard_with_all_forces(shard_dir: Path, shard_list: list[dict]) -> Path:
     for entry in shard_list:
         if shard_has_torsion(shard_dir, entry["shard"]):
             return Path(shard_dir) / entry["shard"]
-    
+
     # Fallback: return the first shard if no shard with torsion is found
     if shard_list:
         return Path(shard_dir) / shard_list[0]["shard"]
-        
+
     raise ValueError("No shards available in the provided shard list")
 
 
@@ -157,6 +156,60 @@ class TrainDataset(Dataset):
 
     def __getitem__(self, index: int) -> Any:
         return self.data[index], self.hp, self.label[index]
+
+
+class VideoDataset(Dataset):
+    def __init__(self, data_file: str | dict, node_index: int) -> None:
+        super().__init__()
+
+        self.data = self.load_data(data_file)
+
+        if not (0 <= node_index < self.__n_nodes):
+            raise ValueError(
+                f"Invalid node_index value must be between 0 and {self.__n_nodes - 1} (inclusive)."
+            )
+
+        self.node_index = node_index
+
+    @staticmethod
+    def load_data(data_file):
+        if isinstance(data_file, dict):
+            return data_file
+
+        with open(data_file) as f:
+            data = json.load(f)
+
+        return data
+
+    @property
+    def data(self):
+        return self.__data
+
+    @data.setter
+    def data(self, x):
+        self.__data = x
+        self.__n_nodes = len(self.data["frames"][0]["nodes"])
+        self.__n_nodes_normalized = self.data["n_nodes"]  # normalized
+
+    def __len__(self):
+        return len(self.data["frames"]) - 1
+
+    def __getitem__(self, index) -> Any:
+        x, y = self.data["frames"][index]["nodes"][self.node_index]
+        vx, vy = self.data["frames"][index]["velocities"][self.node_index]
+        dt = self.data["frames"][index + 1]["dt"]
+        p = self.node_index / (self.__n_nodes - 1)
+        n = self.__n_nodes_normalized
+
+        x_input = torch.tensor([x, y, vx, vy, p, n, dt], dtype=torch.float32)
+
+        return (
+            x_input,
+            torch.tensor(
+                self.data["frames"][index + 1]["nodes"][self.node_index],
+                dtype=torch.float32,
+            ),
+        )
 
 
 class ShardedRopeDataset(IterableDataset):
@@ -262,7 +315,15 @@ class MLP(nn.Module):
         """Phase 1: train the network; shared hyper_params unused here."""
         for p in self.hyper_params.values():
             p.requires_grad_(False)
-        for module in [self.fc1, self.film1, self.fc2, self.film2, self.fc3, self.film3, self.fc_out]:
+        for module in [
+            self.fc1,
+            self.film1,
+            self.fc2,
+            self.film2,
+            self.fc3,
+            self.film3,
+            self.fc_out,
+        ]:
             for param in module.parameters():
                 param.requires_grad_(True)
 
@@ -270,10 +331,18 @@ class MLP(nn.Module):
         """Phase 2: optimize only the shared hyper-params, network fixed.
         Optionally specify a list of hyperparameter keys to exclude from optimization (keep frozen).
         """
-        for module in [self.fc1, self.film1, self.fc2, self.film2, self.fc3, self.film3, self.fc_out]:
+        for module in [
+            self.fc1,
+            self.film1,
+            self.fc2,
+            self.film2,
+            self.fc3,
+            self.film3,
+            self.fc_out,
+        ]:
             for param in module.parameters():
                 param.requires_grad_(False)
-        
+
         exclude_set = set(exclude_hps) if exclude_hps is not None else set()
         for k, p in self.hyper_params.items():
             if k in exclude_set:
@@ -323,10 +392,12 @@ class MLP(nn.Module):
                         val = initial_val[i]
                     else:
                         val = initial_val
-                    self.hyper_params[k].copy_(torch.as_tensor(val, dtype=torch.float32))
+                    self.hyper_params[k].copy_(
+                        torch.as_tensor(val, dtype=torch.float32)
+                    )
                 else:
                     self.hyper_params[k].copy_(true_hp[i])
-        
+
         # Freeze network parameters and exclude non-optimized variables from backpropagation
         exclude_keys = [k for k in HP_KEYS if k not in optimize_keys]
         self.freeze_network(exclude_hps=exclude_keys)
@@ -357,7 +428,7 @@ if __name__ == "__main__":
     # Gracefully handle split sizes, including datasets with 1 or 2 shards
     val_fraction = 0.1
     n_val = int(len(manifest) * val_fraction)
-    
+
     if n_val == 0:
         if len(manifest) == 1:
             # Fallback: with only 1 shard, we must train and validate on the same file
@@ -375,22 +446,30 @@ if __name__ == "__main__":
 
     # --- check for existing trained checkpoint to save time ---
     if model_checkpoint_path.exists():
-        print(f"Loading pre-trained Phase 1 model checkpoint from '{model_checkpoint_path}'...")
+        print(
+            f"Loading pre-trained Phase 1 model checkpoint from '{model_checkpoint_path}'..."
+        )
         model.load(model_checkpoint_path)
     else:
         print("No checkpoint found. Starting Phase 1 training...")
         # --- phase 1: train the network across many rope instances ---
-        train_dataset = ShardedRopeDataset(shard_dir, shard_names=[s["shard"] for s in train_shards])
+        train_dataset = ShardedRopeDataset(
+            shard_dir, shard_names=[s["shard"] for s in train_shards]
+        )
         train_loader = DataLoader(train_dataset, batch_size=32, num_workers=16)
 
         model.freeze_hyperparams()
-        optimizer1 = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+        optimizer1 = torch.optim.Adam(
+            [p for p in model.parameters() if p.requires_grad], lr=1e-3
+        )
 
         n_epochs = 100
         epoch_bar = tqdm(range(n_epochs), desc="Phase 1 (train)", unit="epoch")
         for epoch in epoch_bar:
             total_loss, n_batches = 0.0, 0
-            batch_bar = tqdm(train_loader, desc=f"epoch {epoch}", unit="batch", leave=False)
+            batch_bar = tqdm(
+                train_loader, desc=f"epoch {epoch}", unit="batch", leave=False
+            )
             for x_batch, hp_batch, y_batch in batch_bar:
                 pred = model(x_batch, hp=hp_batch)
                 loss = nn.functional.mse_loss(pred, y_batch)
@@ -411,7 +490,7 @@ if __name__ == "__main__":
     real_shard_path = pick_shard_with_all_forces(shard_dir, val_shards)
     with open(real_shard_path) as f:
         real_records = json.load(f)
-        
+
     # We follow ONLY ONE specific node (node_idx=-1 corresponds to the free end / tip)
     # Because of the updated order, self.hp correctly maps inactive local parameters to 0.0
     real_dataset = TrainDataset(real_records, node_idx=2)
@@ -419,10 +498,21 @@ if __name__ == "__main__":
 
     # --- Phase 2 Configuration: ONE-LINER SETUP ---
     # We choose ["elastic_k_1"] here because node_idx = -1 only has an active parent elastic connection.
-    model.setup_phase2(real_dataset.hp, optimize_keys=["elastic_k_1", "elastic_k_2", "dampening_k", "torsion_k_central"], initial_val=0.5)
+    model.setup_phase2(
+        real_dataset.hp,
+        optimize_keys=[
+            "elastic_k_1",
+            "elastic_k_2",
+            "dampening_k",
+            "torsion_k_central",
+        ],
+        initial_val=0.5,
+    )
 
     # Instantiate Phase 2 optimizer (only receives parameters that require gradients)
-    optimizer2 = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    optimizer2 = torch.optim.Adam(
+        [p for p in model.parameters() if p.requires_grad], lr=1e-3
+    )
 
     n_steps = 1000
     step_bar = tqdm(range(n_steps), desc="Phase 2 (hp fit)", unit="step")
@@ -430,11 +520,11 @@ if __name__ == "__main__":
         for x_batch, _hp_ignored, y_batch in real_loader:
             pred = model(x_batch, hp=None)
             mse_loss = nn.functional.mse_loss(pred, y_batch)
-            
+
             # Penalize negative hyperparameters
             penalty = model.get_hyperparameter_penalty()
             loss = mse_loss + 10.0 * penalty
-            
+
             optimizer2.zero_grad()
             loss.backward()
             optimizer2.step()

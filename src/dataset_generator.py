@@ -38,7 +38,9 @@ def extract_nodes_properties(simulation: Simulation):
 
         dt = simulation.dt
         forces_hyperparams = {}
-        elastic_count = 1  # Distinguish consecutive elastic constraints for the same node
+        elastic_count = (
+            1  # Distinguish consecutive elastic constraints for the same node
+        )
 
         for c in particles[i].constraints:
             variables = vars(c.reference).copy()
@@ -94,13 +96,14 @@ def execution(seed=None, **kwargs):
     rng = np.random.default_rng(seed=seed)
 
     n_nodes = rng.integers(3, 103, dtype=int)
-    anchor_point = rng.integers((0, 0), (500, 200))
-    step = rng.uniform(1, 201)  # base distance between consecutive nodes
-    k = rng.uniform(1, 501)
-    dampening_k = rng.uniform(1, 101)
-    g = rng.uniform(100, 600)
-    torsion_k = rng.uniform(0, 500)
-    angle_deg = rng.uniform(0, 2 * np.pi)
+    # anchor_point = rng.integers((0, 0), (500, 200))
+    anchor_point = (0,0)
+    step = rng.uniform(0.01, 1)  # base distance between consecutive nodes
+    k = rng.uniform(0, 1)
+    dampening_k = rng.uniform(0, 1)
+    g = rng.uniform(0, 1)
+    torsion_k = rng.uniform(0, 1)
+    angle_rad = rng.uniform(0, 2 * np.pi)
 
     particles = create_curling_string(
         simulation,
@@ -108,7 +111,7 @@ def execution(seed=None, **kwargs):
         n=n_nodes,
         step=step,
         k=k,
-        theta0=angle_deg,
+        theta0=angle_rad,
         torsion_k=torsion_k,
         dr=step,
         g=np.array([0, g]),
@@ -122,6 +125,8 @@ def execution(seed=None, **kwargs):
 
     data = []
     for _ in range(kwargs.get("n", kwargs.get("n_iterations", 50))):
+        dt = float(rng.uniform(0.000_001, 0.001_000)) 
+        simulation.dt = dt
         simulation.run(n=1)
         properties = extract_nodes_properties(simulation)
         data.extend(properties)
@@ -132,53 +137,54 @@ def execution(seed=None, **kwargs):
     y_max = y_min
     # normalization
 
-    for p in data:
+    for d in data:
         # find min max values of the x and y coords
-        x_min = min(p["input"]["x"][0], x_min, p["target"][0])
-        x_max = max(p["input"]["x"][0], x_max, p["target"][0])
-        y_min = min(p["input"]["x"][1], y_min, p["target"][1])
-        y_max = max(p["input"]["x"][1], y_max, p["target"][1])
+        x_min = min(d["input"]["x"][0], x_min, d["target"][0])
+        x_max = max(d["input"]["x"][0], x_max, d["target"][0])
+        y_min = min(d["input"]["x"][1], y_min, d["target"][1])
+        y_max = max(d["input"]["x"][1], y_max, d["target"][1])
 
-    for p in data:
-        p["input"]["x"][0] -= x_min
-        p["input"]["x"][1] -= y_min
-        p["target"][0] -= x_min
-        p["target"][1] -= y_min
+    for d in data:
+        d['input']['dt'] /= 0.001
+        d["input"]["x"][0] -= x_min
+        d["input"]["x"][1] -= y_min
+        d["target"][0] -= x_min
+        d["target"][1] -= y_min
 
         x_range = x_max - x_min
         y_range = y_max - y_min
 
         for i, r in enumerate((x_range, y_range)):
             if r == 0:
-                p["input"]["x"][i] = 0
-                p["target"][i] = 0
-                p["input"]["v"][i] = 0
+                d["input"]["x"][i] = 0
+                d["target"][i] = 0
+                d["input"]["v"][i] = 0
             else:
-                p["input"]["x"][i] /= r
-                p["target"][i] /= r
-                p["input"]["v"][i] /= r
+                d["input"]["x"][i] /= r
+                d["target"][i] /= r
+                d["input"]["v"][i] /= r
 
-        p["input"]["n"] = (p["input"]["n"] - 3) / 100
+        d["input"]["n"] = (d["input"]["n"] - 3) / 100
 
-        for key in p["forces_hyperparams"].keys():
-            k = p["forces_hyperparams"][key]
+        for key in d["forces_hyperparams"].keys():
+            k = d["forces_hyperparams"][key]
             match key:
                 case "elastic_force_1" | "elastic_force_2":
-                    k["k"] = (k["k"] - 1) / 500
-                    k["dr"] = (k["dr"] - 1) / 200
+                    k["k"] = k["k"]
+                    k["dr"] = (k["dr"] - 0.01) / 0.99
                 case "torsion_spring_outer_1":
-                    k["k"] /= 500
+                    # k["k"] /= 500
                     k["theta0"] /= 2 * np.pi
                 case "torsion_spring_central":
-                    k["k"] /= 500
+                    # k["k"] /= 500
                     k["theta0"] /= 2 * np.pi
                 case "torsion_spring_outer_2":
-                    k["k"] /= 500
+                    # k["k"] /= 500
                     k["theta0"] /= 2 * np.pi
                 case "dampening_force":
-                    k["k"] = (k["k"] - 1) / 100
-                case "gravitational_force":
-                    k["g"][1] = (k["g"][1] - 100) / 500
+                    k["k"] = k["k"]
+                # case "gravitational_force":
+                    # k["g"][1] = (k["g"][1] - 100) / 500
 
     return data
 
@@ -199,12 +205,17 @@ def generate_dataset(
             simulation_seed = rng.integers(0, sys.maxsize)
             future = executor.submit(
                 execution,
-                **{"seed": simulation_seed, "n_iterations": kwargs.get("n_iterations", 50)},
+                **{
+                    "seed": simulation_seed,
+                    "n_iterations": kwargs.get("n_iterations", 50),
+                },
             )
             futures[future] = sim_idx
 
         for future in tqdm(
-            as_completed(futures), desc="Generating synthetic dataset", total=len(futures)
+            as_completed(futures),
+            desc="Generating synthetic dataset",
+            total=len(futures),
         ):
             sim_idx = futures[future]
             records = future.result()  # only THIS simulation's records in memory
@@ -221,4 +232,4 @@ def generate_dataset(
 
 
 if __name__ == "__main__":
-    generate_dataset("data/shards", seed=1, n_simulations=1, n_iterations=400)
+    generate_dataset("data/shards", seed=1, n_simulations=100, n_iterations=5)

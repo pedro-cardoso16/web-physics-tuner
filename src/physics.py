@@ -3,7 +3,9 @@ import time
 import matplotlib.pyplot as plt
 from typing import Callable, Literal
 from numpy.typing import ArrayLike, NDArray
+
 # from numba import vectorize
+
 
 class Reference:
     def __init__(self, **kwargs) -> None:
@@ -130,7 +132,11 @@ class Simulation:
             self.prev_vel = np.array([p.vp for p in particles], dtype=np.float64)
             self.acc = np.array([p.a for p in particles], dtype=np.float64)
             self.prev_pos = np.array(
-                [p.xp if p.xp is not None else (p.x - p.v * self.dt) for p in particles], dtype=np.float64
+                [
+                    p.xp if p.xp is not None else (p.x - p.v * self.dt)
+                    for p in particles
+                ],
+                dtype=np.float64,
             )
             self.masses = np.array([p.m for p in particles], dtype=np.float64).reshape(
                 -1, 1
@@ -211,7 +217,6 @@ class Simulation:
                     t_theta0.append(getattr(ref, "theta0"))
                     t_k.append(getattr(ref, "k"))
                     t_eps.append(getattr(ref, "epsilon", 1e-4))
-
 
                 # Check for rigid connection constraints
                 elif (
@@ -357,7 +362,6 @@ class Simulation:
                 np.add.at(net_forces, self.torsion_outer1_indices, outer1_forces)
                 np.add.at(net_forces, self.torsion_outer2_indices, outer2_forces)
 
-
             if self.rigid_owner_indices.size > 0:
                 f_rigid = rigid_connection_force(
                     self.masses[self.rigid_owner_indices],
@@ -405,6 +409,10 @@ class Simulation:
             particle.a = self.acc[idx]
             particle.xp = self.prev_pos[idx]
 
+    def clear(self) -> None:
+        self.particles.clear()
+        self.__build_vectorized_params()
+
 
 def elastic_force(
     x1: np.ndarray,
@@ -412,16 +420,22 @@ def elastic_force(
     k: float | np.ndarray,
     dr: float | np.ndarray,
     d_min: float | np.ndarray = 0.0001,
+    d_max: float | np.ndarray = np.finfo("float").max / 1000,
+    max_force: float = 1e6,  # tune to whatever scale is physically sensible for your sim
 ) -> np.ndarray:
-
+    
     dx = x2 - x1
     d = np.linalg.norm(dx, axis=-1, keepdims=True)
 
-    # select between itself and the minimal distance, avoids force explosion.
-    d = np.maximum(d, d_min)
+    # select between itself and allowed distance range, avoids force explosion.
+    d = np.minimum(np.maximum(d, d_min), d_max)
 
     dxu = dx / d  # dx unitary vector
-    f = dxu * (k * (d - dr))  # force
+
+    mag = k * (d - dr)
+    mag = np.clip(mag, -max_force, max_force)  # the actual overflow guard
+
+    f = dxu * mag  # force
 
     return f
 
@@ -621,7 +635,9 @@ def rope_force(
     # Row is "slack" (rope not taut) when within d_max, mask instead of `if`,
     # same pattern as torsion_spring_force's `degenerate` mask.
     slack = future_rel_pos_norm <= d_max
-    norm_safe = np.where(slack, 1.0, future_rel_pos_norm)  # avoid div-by-zero on slack rows
+    norm_safe = np.where(
+        slack, 1.0, future_rel_pos_norm
+    )  # avoid div-by-zero on slack rows
     future_rel_pos_normalized = future_rel_pos / norm_safe
 
     f = -(mass / dt**2) * (future_rel_pos_norm - d_max) * future_rel_pos_normalized
@@ -713,9 +729,7 @@ def torsion_spring_force(
     bisector_degenerate = bisector_len < epsilon
     bisector_len_safe = np.where(bisector_degenerate, 1.0, bisector_len)
 
-    fallback_direction = np.column_stack(
-        [-v1_normalized[:, 1], v1_normalized[:, 0]]
-    )
+    fallback_direction = np.column_stack([-v1_normalized[:, 1], v1_normalized[:, 0]])
     direction = np.where(
         bisector_degenerate, fallback_direction, bisector / bisector_len_safe
     )
@@ -724,12 +738,8 @@ def torsion_spring_force(
     central_force = -delta_theta_sign * central_magnitude * direction
 
     # 4. Outer Forces perpendicular to their respective segments
-    v1_perpendicular = np.column_stack(
-        [-v1_normalized[:, 1], v1_normalized[:, 0]]
-    )
-    v2_perpendicular = np.column_stack(
-        [v2_normalized[:, 1], -v2_normalized[:, 0]]
-    )
+    v1_perpendicular = np.column_stack([-v1_normalized[:, 1], v1_normalized[:, 0]])
+    v2_perpendicular = np.column_stack([v2_normalized[:, 1], -v2_normalized[:, 0]])
 
     torque_scalar = delta_theta_sign * k * delta_theta
     outer_force_1 = (torque_scalar / len1_safe) * v1_perpendicular
@@ -744,6 +754,7 @@ def torsion_spring_force(
         return central_force[0], outer_force_1[0], outer_force_2[0]
 
     return central_force, outer_force_1, outer_force_2
+
 
 def make_torsion_spring_constraint(
     central_particle: Particle,

@@ -17,8 +17,8 @@
 ## Optics & Object Tracking
 - [x] Blur filter for noise reduction
 - [x] Video point extraction pipeline
-- [ ] Demo video verification
-- [ ] Implement point correlation/tracking across frames (minimizing overall Euclidean displacement)
+- [x] Demo video verification
+- [x] Implement point correlation/tracking across frames (minimizing overall Euclidean displacement)
 
 ## Inverse Problem Optimization
 - [ ] ML pipeline for parameter retrieval

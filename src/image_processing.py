@@ -465,12 +465,12 @@ def visualize_nodes_in_video(fp: str, original_video: str | None = None):
 
 
 if __name__ == "__main__":
-    vid = cv.VideoCapture("media/vids/demo_3.mp4")
+    vid = cv.VideoCapture("media/vids/vid.mp4")
     # ret, frame = vid.read()
     # frame = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
     # cv.imshow("bw_frame", frame)
 
-    thresh = 80
+    # thresh = 80
     # frame = preprocess_and_skeletonize(frame, thresh=thresh)
 
     # Blurring for salt-and-pepper noise removal
@@ -489,12 +489,12 @@ if __name__ == "__main__":
     # cv.imshow("Frame", img_binary)
     # cv.waitKey(0)
     # cv.destroyAllWindows()
-    output = extract_nodes_from_video(vid, save_to_file="output.json", thresh=147, anchor_pt=np.array([500,0]))
+    output = extract_nodes_from_video(vid, save_to_file="output.json", thresh=130, anchor_pt=np.array([500,0]))
 
     # with open("output.json", "w") as f:
     #     json.dump(output, f, indent=2)
 
-    visualize_nodes_in_video("output.json", "media/vids/demo_3.mp4")
+    visualize_nodes_in_video("output.json", "media/vids/vid.mp4")
 
     # np.save("output.npy", output)
     # array: np.ndarray = np.load("output.npy", allow_pickle=True)
