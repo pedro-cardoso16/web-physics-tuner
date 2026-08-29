@@ -29,7 +29,7 @@ def extract_nodes_properties(simulation: Simulation):
     data = []
 
     for i in range(len(particles)):
-        x = particles[i].xp.tolist()
+        x = particles[i].xp.tolist()  # type: ignore
         v = particles[i].vp.tolist()
         n = len(particles)
         p = i / (n - 1) if n > 1 else 0
@@ -97,7 +97,7 @@ def execution(seed=None, **kwargs):
 
     n_nodes = rng.integers(3, 103, dtype=int)
     # anchor_point = rng.integers((0, 0), (500, 200))
-    anchor_point = (0,0)
+    anchor_point = (0, 0)
     step = rng.uniform(0.01, 1)  # base distance between consecutive nodes
     k = rng.uniform(0, 1)
     dampening_k = rng.uniform(0, 1)
@@ -125,7 +125,7 @@ def execution(seed=None, **kwargs):
 
     data = []
     for _ in range(kwargs.get("n", kwargs.get("n_iterations", 50))):
-        dt = float(rng.uniform(0.000_001, 0.001_000)) 
+        dt = float(rng.uniform(0.0001, 0.03))  # now it shouldn't break :)
         simulation.dt = dt
         simulation.run(n=1)
         properties = extract_nodes_properties(simulation)
@@ -145,7 +145,7 @@ def execution(seed=None, **kwargs):
         y_max = max(d["input"]["x"][1], y_max, d["target"][1])
 
     for d in data:
-        d['input']['dt'] /= 0.001
+        d["input"]["dt"] /= 0.001
         d["input"]["x"][0] -= x_min
         d["input"]["x"][1] -= y_min
         d["target"][0] -= x_min
@@ -184,7 +184,7 @@ def execution(seed=None, **kwargs):
                 case "dampening_force":
                     k["k"] = k["k"]
                 # case "gravitational_force":
-                    # k["g"][1] = (k["g"][1] - 100) / 500
+                # k["g"][1] = (k["g"][1] - 100) / 500
 
     return data
 
@@ -232,4 +232,4 @@ def generate_dataset(
 
 
 if __name__ == "__main__":
-    generate_dataset("data/shards", seed=1, n_simulations=100, n_iterations=5)
+    generate_dataset("data/shards", seed=1, n_simulations=5000, n_iterations=400, max_workers=4)

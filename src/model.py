@@ -1,5 +1,6 @@
 import json
 import random
+import logging
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -171,9 +172,48 @@ class VideoDataset(Dataset):
 
         self.node_index = node_index
 
+        # Each consecutive pair of frames is equivelent to one input plus label.
+        n_frame_data = len(self.data["frames"]) - 1
+        self.input_data = torch.empty((n_frame_data, 7), dtype=torch.float32)
+        self.label = torch.empty((n_frame_data, 2), dtype=torch.float32)
+
+        for i in range(n_frame_data):
+            self.input_data[i] = torch.tensor(
+                self.video_data_to_input(self.data, self.node_index, i),
+                dtype=torch.float32,
+            )
+            self.label[i] = torch.tensor(
+                self.video_data_to_label(self.data, self.node_index, i),
+                dtype=torch.float32,
+            )
+
+    @staticmethod
+    def video_data_to_input(data: dict, node_index: int, frame_index: int) -> tuple:
+        n_nodes = data["n_nodes"]
+        n_nodes_normalized = data["n_nodes_normalized"]
+
+        x, y = data["frames"][frame_index]["nodes"][node_index]
+        vx, vy = data["frames"][frame_index]["velocities"][node_index]
+        dt = data["frames"][frame_index + 1]["dt"]  # dt into the future
+        p = node_index / (n_nodes - 1)
+        n = n_nodes_normalized
+
+        return x, y, vx, vy, p, n, dt
+
+    @staticmethod
+    def video_data_to_label(data: dict, node_index: int, frame_index: int) -> tuple:
+        x, y = data["frames"][frame_index + 1]["nodes"][node_index]
+
+        return x, y
+
+    @staticmethod
+    def get_num_nodes(data) -> int:
+        return len(VideoDataset.load_data(data)["frames"][0]["nodes"])
+
     @staticmethod
     def load_data(data_file):
         if isinstance(data_file, dict):
+            logging.log(0, "Using shared data for VideoDataloader")
             return data_file
 
         with open(data_file) as f:
@@ -188,28 +228,22 @@ class VideoDataset(Dataset):
     @data.setter
     def data(self, x):
         self.__data = x
-        self.__n_nodes = len(self.data["frames"][0]["nodes"])
-        self.__n_nodes_normalized = self.data["n_nodes"]  # normalized
+        self.__n_nodes = self.data['n_nodes']
+        self.__n_nodes_normalized = self.data["n_nodes_normalized"]  # normalized
+
+    @property
+    def n_nodes(self):
+        return self.__n_nodes
+
+    @property
+    def n_nodes_normalized(self):
+        return self.__n_nodes_normalized
 
     def __len__(self):
         return len(self.data["frames"]) - 1
 
     def __getitem__(self, index) -> Any:
-        x, y = self.data["frames"][index]["nodes"][self.node_index]
-        vx, vy = self.data["frames"][index]["velocities"][self.node_index]
-        dt = self.data["frames"][index + 1]["dt"]
-        p = self.node_index / (self.__n_nodes - 1)
-        n = self.__n_nodes_normalized
-
-        x_input = torch.tensor([x, y, vx, vy, p, n, dt], dtype=torch.float32)
-
-        return (
-            x_input,
-            torch.tensor(
-                self.data["frames"][index + 1]["nodes"][self.node_index],
-                dtype=torch.float32,
-            ),
-        )
+        return self.input_data[index], self.label[index]
 
 
 class ShardedRopeDataset(IterableDataset):
@@ -454,7 +488,7 @@ if __name__ == "__main__":
         print("No checkpoint found. Starting Phase 1 training...")
         # --- phase 1: train the network across many rope instances ---
         train_dataset = ShardedRopeDataset(
-            shard_dir, shard_names=[s["shard"] for s in train_shards]
+            shard_dir, shard_names=[s["shard"] for s in train_shards]  # type: ignore
         )
         train_loader = DataLoader(train_dataset, batch_size=32, num_workers=16)
 
@@ -528,7 +562,7 @@ if __name__ == "__main__":
             optimizer2.zero_grad()
             loss.backward()
             optimizer2.step()
-        step_bar.set_postfix(loss=f"{loss.item():.8f}")
+        step_bar.set_postfix(loss=f"{loss.item():.8f}")  # type: ignore
 
     # --- comparison table: true vs recovered hyper-params ---
     true_hp = real_dataset.hp.tolist()

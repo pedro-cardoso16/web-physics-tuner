@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import pandas as pd
-from model import MLP, TrainDataset, HP_KEYS, pick_shard_with_all_forces
+from model import MLP, TrainDataset, VideoDataset, HP_KEYS, pick_shard_with_all_forces
 from physics import (
     Simulation,
     Particle,
@@ -47,6 +47,244 @@ def get_active_keys_for_node(i: int, n_nodes: int) -> list[str]:
         active.extend(["torsion_theta0_outer2", "torsion_k_outer2"])
 
     return active
+
+
+def load_video_data(file_path: Path) -> dict:
+    with open(file_path) as f:
+        data = json.load(f)
+
+    n_nodes = data["n_nodes"]
+
+    if not isinstance(n_nodes, int):
+        raise ValueError("The number of nodes n_nodes must be an integer.")
+
+    if n_nodes <= 0:
+        raise ValueError("Could not determine node count from video data.")
+
+    return data
+
+
+from typing import Literal
+
+
+def optimize_parallel_machines(
+    data: Path | dict,
+    model: Path = Path("pinn_model.pt"),
+    device: Literal["cpu", "cuda"] = "cpu",
+    lr: float = 1e-3,
+    lambda_consensus: float = 10.0,
+    n_steps: int = 10_000,
+    exclude_from_optimization: (
+        list[str] | None
+    ) = None,  # Added list to explicitly exclude HPs
+    output_file: str | None = None,
+):
+    if isinstance(data, Path):
+        data = load_video_data(data)
+
+    n = data["n_nodes"]  # Number of machines (one per node).
+
+    # 1. Instantiate  parallel machines and local datasets
+    machines = []
+    datasets = []
+    x_all = []
+    y_all = []
+
+    for i in range(n):
+        m = MLP().to(device)  # machine
+        if model.exists():
+            m.load("pinn_model.pt")
+
+        machines.append(m)
+
+        ds = VideoDataset(data, node_index=i)
+        datasets.append(ds)
+        x_all.append(ds.input_data.to(device))
+        y_all.append(ds.label.to(device))
+
+    # --- Step 2 ---
+    # region Apply localized parameter configurations based on node positioning
+    for i in range(n):
+        active_keys = get_active_keys_for_node(i, n)
+
+        # setup_phase2 sets true_values for frozen parameters (which are 0.0 on inactive nodes)
+        # and configures gradients accordingly
+        machines[i].setup_phase2(
+            datasets[i].hp, optimize_keys=active_keys, initial_val=0.5
+        )
+
+    # endregion
+
+    # 3. Collect active parameters from all nodes for the joint optimizer
+    params_to_optimize = []
+    for i in range(1, n):  # Node 0 is pivot and stays completely frozen
+        params_to_optimize.extend(
+            [p for p in machines[i].parameters() if p.requires_grad]
+        )
+
+    optimizer = torch.optim.Adam(params_to_optimize, lr=lr)
+
+    # 4. Joint Optimization Loop
+    for step in range(n):
+        optimizer.zero_grad()
+
+        # Compute local fitting and boundary penalties
+        local_losses = []
+        neg_penalties = []
+        for i in range(1, n):
+            pred = machines[i](x_all[i], hp=None)
+            mse_loss = nn.functional.mse_loss(pred, y_all[i])
+            # Penalty of negative hyper-parameters.
+            neg_penalty = machines[i].get_hyperparameter_penalty()
+
+            local_losses.append(mse_loss)
+            neg_penalties.append(neg_penalty)
+
+        total_local_loss = torch.sum(torch.stack(local_losses))
+        total_neg_penalty = torch.sum(torch.stack(neg_penalties))
+
+        # Compute Consensus Penalties.
+        # Global gravity g consensus.
+        g_vals = torch.stack([machines[i].hyper_params["g"] for i in range(1, n)])
+        g_consensus = torch.sum((g_vals - torch.mean(g_vals)) ** 2)
+
+        # Global dampening dampening_k consensus
+        damp_vals = torch.stack(
+            [machines[i].hyper_params["dampening_k"] for i in range(1, n)]
+        )
+        damp_consensus = torch.sum((damp_vals - torch.mean(damp_vals)) ** 2)
+
+        # Elastic spring consensus (coupling elastic_k_2 at node i-1 to elastic_k_1 at node i)
+        elastic_k_diffs = []
+        elastic_dr_diffs = []
+        for i in range(2, n):
+            elastic_k_diffs.append(
+                (
+                    machines[i].hyper_params["elastic_k_1"]
+                    - machines[i - 1].hyper_params["elastic_k_2"]
+                )
+                ** 2
+            )
+            elastic_dr_diffs.append(
+                (
+                    machines[i].hyper_params["elastic_dr_1"]
+                    - machines[i - 1].hyper_params["elastic_dr_2"]
+                )
+                ** 2
+            )
+
+        elastic_k_consensus = (
+            torch.sum(torch.stack(elastic_k_diffs))
+            if elastic_k_diffs
+            else torch.tensor(0.0, device=device)
+        )
+        elastic_dr_consensus = (
+            torch.sum(torch.stack(elastic_dr_diffs))
+            if elastic_dr_diffs
+            else torch.tensor(0.0, device=device)
+        )
+
+        # Torsion spring consensus (coupling central joint j with arms at j+1 and j-1)
+        torsion_k_penalty = torch.tensor(0.0, device=device)
+        torsion_theta_penalty = torch.tensor(0.0, device=device)
+        for j in range(1, n - 1):
+            k_terms = [machines[j].hyper_params["torsion_k_central"]]
+            theta_terms = [machines[j].hyper_params["torsion_theta0_central"]]
+
+            # Node j+1 represents outer_1
+            k_terms.append(machines[j + 1].hyper_params["torsion_k_outer1"])
+            theta_terms.append(machines[j + 1].hyper_params["torsion_theta0_outer1"])
+
+            # Node j-1 represents outer_2 (only if it is a moving node, j-1 >= 1)
+            if j >= 2:
+                k_terms.append(machines[j - 1].hyper_params["torsion_k_outer2"])
+                theta_terms.append(
+                    machines[j - 1].hyper_params["torsion_theta0_outer2"]
+                )
+
+            if len(k_terms) > 1:
+                k_stack = torch.stack(k_terms)
+                torsion_k_penalty += torch.sum((k_stack - torch.mean(k_stack)) ** 2)
+
+                theta_stack = torch.stack(theta_terms)
+                torsion_theta_penalty += torch.sum(
+                    (theta_stack - torch.mean(theta_stack)) ** 2
+                )
+
+        # Joint total loss calculation
+        loss = (
+            total_local_loss
+            + 10.0 * total_neg_penalty
+            + lambda_consensus
+            * (
+                g_consensus
+                + damp_consensus
+                + elastic_k_consensus
+                + elastic_dr_consensus
+                + torsion_k_penalty
+                + torsion_theta_penalty
+            )
+        )
+
+        loss.backward()
+        optimizer.step()
+
+        if step % 100 == 0 or step == n_steps - 1:
+            print(
+                f"Step {step:04d}/{n_steps} | Total Joint Loss: {loss.item():.6f} | Local Fit Loss: {total_local_loss.item():.6f}"
+            )
+
+    # region Generate and print individual summary tables for each node
+
+    pd.set_option("display.float_format", lambda v: f"{v:.6f}")
+
+    for i in range(n):
+        print(f"\n>>> Node {i} parameter discovery:")
+        if i == 0:
+            print("  [Stationary Pivot Node - All parameters locked at 0.0]")
+            p_true = [0.0] * len(HP_KEYS)
+            p_rec = [0.0] * len(HP_KEYS)
+            p_err = [0.0] * len(HP_KEYS)
+            p_status = ["Static Pivot"] * len(HP_KEYS)
+        else:
+            active_keys = get_active_keys_for_node(i, n)
+
+            # Re-apply exclusion check for descriptive logging in console printout
+            if exclude_from_optimization is not None:
+                active_keys = [
+                    k for k in active_keys if k not in exclude_from_optimization
+                ]
+
+            p_true = []
+            p_rec = []
+            p_err = []
+            p_status = []
+            for idx, k in enumerate(HP_KEYS):
+                t_val = datasets[i].hp[idx].item()
+                r_val = machines[i].hyper_params[k].item()
+                p_true.append(t_val)
+                p_rec.append(r_val)
+                p_err.append(abs(t_val - r_val))
+
+                # Check status
+                if k in active_keys:
+                    status_str = "Active"
+                elif exclude_from_optimization and k in exclude_from_optimization:
+                    status_str = "Frozen (True Value)"
+                else:
+                    status_str = "Frozen (0.0)"
+                p_status.append(status_str)
+
+        node_df = pd.DataFrame(
+            {
+                "hyper_param": list(HP_KEYS),
+                "recovered_val": p_rec,
+                "status": p_status,
+            }
+        )
+        print(node_df.to_string(index=False))
+
+    # endregion
 
 
 def optimize_parallel_system(
@@ -326,7 +564,7 @@ def optimize_parallel_system(
 
 
 class Optimizer:
-    def __init__(self, data: dict) -> None:
+    def __init__(self, data: dict, model: str | torch.Tensor) -> None:
         self.data = data
         self.simulations = []
         pass
@@ -337,6 +575,18 @@ class Optimizer:
         Optimization using MLP parallel execution
 
         """
+
+        from model import VideoDataset
+
+        shared_data = VideoDataset.load_data("output_normalized.json")
+
+
+        # Create the instances of dataset for each node in the data.
+
+        optimize_parallel_machines(shared_data)
+
+        # Execute in parallel for each one of the nodes.
+
         pass
 
     def fine_optimize(self, hyper_parameters: dict | None = None, n_frames: int = 10):
@@ -418,9 +668,6 @@ def fit_hyper_parameters(
         )
 
         particle.constraints.extend(constraints)
-
-
-    
 
 
 if __name__ == "__main__":

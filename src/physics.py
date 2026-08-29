@@ -74,7 +74,7 @@ class Particle:
 
         return self.v
 
-    def update_vars(self, dt) -> None:
+    def update_vars(self, dt, dtp: None | float = None) -> None:
         if self.xp is None:
             self.xp = self.x[:]
             self.x = self.x + self.v * dt + 0.5 * self.a * dt**2
@@ -82,7 +82,7 @@ class Particle:
             return
 
         # Calculate next position using Störmer-Verlet
-        xn = stromer(self.x, self.xp, self.a, dt)
+        xn = stromer(self.x, self.xp, self.a, dt, dtp)
 
         # Update the previous position
         self.xp[:] = self.x[:]
@@ -109,6 +109,7 @@ class Particle:
 class Simulation:
     def __init__(self, particles: list[Particle] = []) -> None:
         self.dt = 0.001
+        self.dtp = None
         self.particles = particles
 
     @property
@@ -205,9 +206,9 @@ class Simulation:
                     if id(ref) in seen_torsion_refs:
                         continue
                     try:
-                        c_idx = self.particles.index(ref.central_particle)
-                        o1_idx = self.particles.index(ref.outer_particle_1)
-                        o2_idx = self.particles.index(ref.outer_particle_2)
+                        c_idx = self.particles.index(ref.central_particle)  # type: ignore
+                        o1_idx = self.particles.index(ref.outer_particle_1) # type: ignore
+                        o2_idx = self.particles.index(ref.outer_particle_2) # type: ignore
                     except ValueError:
                         continue
                     seen_torsion_refs.add(id(ref))
@@ -226,7 +227,7 @@ class Simulation:
                     and hasattr(ref, "dt")
                 ):
                     try:
-                        pivot_idx = self.particles.index(ref.pivot_particle)
+                        pivot_idx = self.particles.index(ref.pivot_particle) # type: ignore
                     except ValueError:
                         continue
                     r_owner.append(idx)
@@ -242,7 +243,7 @@ class Simulation:
                     and hasattr(ref, "dt")
                 ):
                     try:
-                        pivot_idx = self.particles.index(ref.pivot_particle)
+                        pivot_idx = self.particles.index(ref.pivot_particle) # type: ignore
                     except ValueError:
                         continue
                     rope_owner.append(idx)
@@ -391,7 +392,8 @@ class Simulation:
             self.acc[fixed_mask] = 0
 
             # 3. Vectorized Stormer-Verlet integration (reuses `stromer`)
-            next_pos = stromer(self.pos, self.prev_pos, self.acc, self.dt)
+            next_pos = stromer(self.pos, self.prev_pos, self.acc, self.dt, self.dtp)
+            self.dtp = self.dt # save previous time step
             self.prev_pos = self.pos.copy()
             self.pos = next_pos
 
@@ -423,7 +425,7 @@ def elastic_force(
     d_max: float | np.ndarray = np.finfo("float").max / 1000,
     max_force: float = 1e6,  # tune to whatever scale is physically sensible for your sim
 ) -> np.ndarray:
-    
+
     dx = x2 - x1
     d = np.linalg.norm(dx, axis=-1, keepdims=True)
 
@@ -824,16 +826,24 @@ def add_constraint_to_particle(particle: Particle, *constraint: Constraint) -> N
     particle.constraints.extend(constraint)
 
 
-def stromer(x: NDArray, xp: NDArray, a: NDArray, dt: float) -> np.ndarray:
+def stromer(
+    x: np.ndarray, xp: np.ndarray, a: np.ndarray, dt: float, dtp: None | float = None
+) -> np.ndarray:
     """Computes next stromer position `xn`.
 
     Args:
-        x (float): current position of the object
-        xp (float): previous object's position
-        a (float): current acceleration
+        x (ndarray): current position of the object
+        xp (ndarray): previous object's position
+        a (ndarray): current acceleration
         dt (float): time step
+        dtp (None, float): previous time step (for time corrected integration)
     """
-    xn = (2 * x - xp) + a * dt**2
+    if dtp is None or dt == dtp:
+        xn = (2 * x - xp) + a * dt**2  # no time correction
+    else:
+        xn = (
+            x + (x - xp) * (dt / dtp) + (a / 2) * (dt + dtp) * dt
+        )  # time corrected integraion
 
     return xn
 

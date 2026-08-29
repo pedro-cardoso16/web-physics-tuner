@@ -4,15 +4,16 @@
 - [x] Constraints: gravity, dampening, rigid connections
 - [x] Helpers for constraints and mesh presets (e.g., flags)
 - [x] Torsion force implementation
+- [x] Implement time corrected verlet integration
 
 ## Dataset Generation
 - [ ] Synthetic data pipeline:
     - [ ] Randomize base string properties
     - [ ] Randomize initial positions and velocities
 - [x] JSON export system
-- [ ] Simulation parameters: gravity, elastic/dampening forces, mass
+- [x] Simulation parameters: gravity, elastic/dampening forces, mass
 - [ ] Data loaders for train/test pipelines
-- [ ] Normalize all the required data
+- [x] Normalize all the required data
 
 ## Optics & Object Tracking
 - [x] Blur filter for noise reduction
@@ -28,3 +29,5 @@
 - [x] Set the normalization setup
 - [ ] Generate final dataset
 - [ ] Focus on the NN architecture
+
+- [ ] Add mass to the possible hyper-parameters.

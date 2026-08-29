@@ -58,7 +58,9 @@ def normalize_data_for_neural_net(file: str, output_file: str, **kwargs):
         frame_data["dt"] = (frame_data["dt"] - kwargs["dt_min"]) / (
             kwargs["dt_max"] - kwargs["dt_min"]
         )
-    output_data["n_nodes"] = (n_nodes - kwargs["n_nodes_min"]) / (
+        
+    output_data["n_nodes"] = n_nodes
+    output_data["n_nodes_normalized"] = (n_nodes - kwargs["n_nodes_min"]) / (
         kwargs["n_nodes_max"] - kwargs["n_nodes_min"]
     )
     with open(output_file, "w") as f:
