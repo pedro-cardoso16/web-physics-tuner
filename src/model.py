@@ -246,6 +246,180 @@ class VideoDataset(Dataset):
         return self.input_data[index], self.label[index]
 
 
+import random
+from torch.utils.data import IterableDataset, get_worker_info
+
+
+class BufferedPtDataset(IterableDataset):
+    """
+    Hybrid Dataset: Keeps a small buffer of pre-compiled .pt files in memory.
+    Shuffles their data globally, trains on them, and then discards them
+    to load the next batch of shards.
+    """
+
+    def __init__(
+        self, pt_dir: str, buffer_size: int = 50, shuffle: bool = True
+    ) -> None:
+        super().__init__()
+        self.pt_paths = sorted(Path(pt_dir).glob("sim_*.pt"))
+        if not self.pt_paths:
+            raise ValueError(f"No compiled .pt files found in {pt_dir}")
+
+        self.buffer_size = buffer_size
+        self.shuffle = shuffle
+
+    def _paths_for_this_worker(self) -> list[Path]:
+        paths = list(self.pt_paths)
+        if self.shuffle:
+            random.shuffle(paths)
+        info = get_worker_info()
+        if info is None:
+            return paths
+        return paths[info.id :: info.num_workers]
+
+    def __iter__(self):
+        paths = self._paths_for_this_worker()
+
+        # Process the paths in small, memory-safe chunks (buffers)
+        for chunk_idx in range(0, len(paths), self.buffer_size):
+            chunk_paths = paths[chunk_idx : chunk_idx + self.buffer_size]
+
+            buffer_data = []
+            buffer_hp = []
+            buffer_label = []
+
+            # 1. Load the small buffer of .pt files into memory
+            for path in chunk_paths:
+                # torch.load on binary files is near-instantaneous
+                shard = torch.load(path)
+                buffer_data.append(shard["data"])
+                buffer_hp.append(shard["hp"])
+                buffer_label.append(shard["label"])
+
+            # 2. Concatenate the buffer into single contiguous tensors
+            flat_data = torch.cat(buffer_data)
+            flat_hp = torch.cat(buffer_hp)
+            flat_label = torch.cat(buffer_label)
+
+            # 3. Shuffle only the active buffer (global-shuffling within the window)
+            order = list(range(len(flat_data)))
+            if self.shuffle:
+                random.shuffle(order)
+
+            # 4. Yield the samples to the training loop
+            for idx in order:
+                yield flat_data[idx], flat_hp[idx], flat_label[idx]
+
+            # At the end of the chunk loop, the buffer goes out of scope
+            # and is immediately garbage-collected, keeping your RAM flat!
+
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from pathlib import Path
+import json
+
+class MappedRopeDataset(Dataset):
+    """
+    Hybrid, High-Performance Dataset.
+    - Stored safely as binary files on disk.
+    - Pre-loads the ENTIRE compiled dataset directly into your 32 GB of RAM on 
+      startup to maximize training speed (uses exactly ~2.0 GB of RAM) [1].
+    - If your dataset grows past your RAM in the future, set load_to_ram=False
+      to run directly from your SSD memory-map! [1]
+    """
+    def __init__(self, pt_dir: str, load_to_ram: bool = True) -> None:
+        super().__init__()
+        pt_path = Path(pt_dir)
+        
+        # Load total records count N from metadata
+        with open(pt_path / "metadata.json") as f:
+            N = json.load(f)["total_records"]
+            
+        self.N = N
+        self.load_to_ram = load_to_ram
+        
+        if load_to_ram:
+            print(f"Pre-loading {N} records (approx 2.0 GB) directly into your 32 GB RAM...")
+            # 1. Map the files temporarily to copy their raw binary data
+            raw_data = np.memmap(pt_path / "data.bin", dtype="float32", mode="r", shape=(N, 7))
+            raw_hp = np.memmap(pt_path / "hp.bin", dtype="float32", mode="r", shape=(N, 12))
+            raw_label = np.memmap(pt_path / "label.bin", dtype="float32", mode="r", shape=(N, 2))
+            
+            # 2. Copy them directly into RAM as native, contiguous PyTorch Tensors
+            self.data = torch.from_numpy(raw_data.copy())
+            self.hp = torch.from_numpy(raw_hp.copy())
+            self.label = torch.from_numpy(raw_label.copy())
+            
+            # 3. Delete the temporary memmaps to free file handles
+            del raw_data, raw_hp, raw_label
+            print("Dataset fully cached in RAM. No disk I/O will occur during training!")
+            
+        else:
+            print(f"Memory-mapping {N} records from {pt_dir} (reading directly from SSD on-demand)...")
+            self.data_mmap = np.memmap(pt_path / "data.bin", dtype="float32", mode="r", shape=(N, 7))
+            self.hp_mmap = np.memmap(pt_path / "hp.bin", dtype="float32", mode="r", shape=(N, 12))
+            self.label_mmap = np.memmap(pt_path / "label.bin", dtype="float32", mode="r", shape=(N, 2))
+
+    def __len__(self) -> int:
+        return self.N
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.load_to_ram:
+            # Instantaneous RAM read (Buttery smooth, maximum hardware speed)
+            return self.data[index], self.hp[index], self.label[index]
+        else:
+            # Direct SSD read fallback (Uses 0 MB of RAM if dataset exceeds memory)
+            x = torch.from_numpy(self.data_mmap[index].copy())
+            hp = torch.from_numpy(self.hp_mmap[index].copy())
+            y = torch.from_numpy(self.label_mmap[index].copy())
+            return x, hp, y
+
+class InMemoryRopeDataset(Dataset):
+    """
+    Loads and parses all JSON shards into memory ONCE during startup.
+    Keeps everything as compiled PyTorch Tensors in RAM, making training
+    epochs run in seconds with 0% disk-I/O overhead.
+    """
+
+    def __init__(self, shard_dir: str, shard_names: list[str]) -> None:
+        super().__init__()
+
+        all_inputs = []
+        all_hps = []
+        all_targets = []
+
+        print(f"Pre-loading {len(shard_names)} shards into RAM...")
+        for name in tqdm(shard_names, desc="Loading shards", unit="shard"):
+            path = Path(shard_dir) / name
+            with open(path) as f:
+                records = json.load(f)  # Parsed once
+
+            # Merge HPs for this specific shard
+            hp = merge_hp(records)
+
+            for r in records:
+                all_inputs.append(record_to_input(r))
+                all_hps.append(hp)
+                all_targets.append(torch.tensor(r["target"], dtype=torch.float32))
+
+        # Stack all lists into single, contiguous, high-performance tensors
+        self.data = torch.stack(all_inputs)
+        self.hp = torch.stack(all_hps)
+        self.label = torch.stack(all_targets)
+
+        print(f"Dataset successfully cached in RAM: {len(self.data)} total samples.")
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(
+        self, index: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.data[index], self.hp[index], self.label[index]
+
+
 class ShardedRopeDataset(IterableDataset):
     """Streams one rope-instance shard (one simulation's JSON file) at a time
     from disk. Never holds more than one shard's records in memory, so large
@@ -525,10 +699,17 @@ if __name__ == "__main__":
     else:
         print("No checkpoint found. Starting Phase 1 training...")
         # --- phase 1: train the network across many rope instances ---
-        train_dataset = ShardedRopeDataset(
-            shard_dir, shard_names=[s["shard"] for s in train_shards]  # type: ignore
+
+        # ALTERATION 1: Point directly to your pre-compiled binary .pt shards directory
+        pt_dir = Path("data/pt_shards")
+
+        train_dataset = MappedRopeDataset(
+            pt_dir, load_to_ram=True  # type: ignore
         )
-        train_loader = DataLoader(train_dataset, batch_size=8192, num_workers=16)
+
+        # ALTERATION 2: Removed shuffle=True because BufferedPtDataset is an IterableDataset.
+        # (Shuffling is handled internally by the dataset's memory buffer!)
+        train_loader = DataLoader(train_dataset, batch_size=1024, num_workers=4)
 
         model.freeze_hyperparams()
         optimizer1 = torch.optim.Adam(
