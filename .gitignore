@@ -219,3 +219,6 @@ __marimo__/
 
 # Playground files.
 playground.py
+
+# Large files
+data/shards/

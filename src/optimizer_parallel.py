@@ -85,7 +85,7 @@ def optimize_parallel_machines(
     n = data["n_nodes"]  # Number of machines (one per node).
 
     # 1. Instantiate  parallel machines and local datasets
-    machines = []
+    machines: list[MLP] = []
     datasets = []
     x_all = []
     y_all = []
@@ -109,8 +109,8 @@ def optimize_parallel_machines(
 
         # setup_phase2 sets true_values for frozen parameters (which are 0.0 on inactive nodes)
         # and configures gradients accordingly
-        machines[i].setup_phase2(
-            datasets[i].hp, optimize_keys=active_keys, initial_val=0.5
+        machines[i].setup_hyperparameters_tuning(
+            optimize_keys=active_keys, initial_val=0.5
         )
 
     # endregion
@@ -125,7 +125,7 @@ def optimize_parallel_machines(
     optimizer = torch.optim.Adam(params_to_optimize, lr=lr)
 
     # 4. Joint Optimization Loop
-    for step in range(n):
+    for step in range(n_steps):
         optimizer.zero_grad()
 
         # Compute local fitting and boundary penalties
@@ -157,6 +157,7 @@ def optimize_parallel_machines(
         # Elastic spring consensus (coupling elastic_k_2 at node i-1 to elastic_k_1 at node i)
         elastic_k_diffs = []
         elastic_dr_diffs = []
+
         for i in range(2, n):
             elastic_k_diffs.append(
                 (
@@ -260,11 +261,11 @@ def optimize_parallel_machines(
             p_err = []
             p_status = []
             for idx, k in enumerate(HP_KEYS):
-                t_val = datasets[i].hp[idx].item()
+                # t_val = datasets[i].hp[idx].item()
                 r_val = machines[i].hyper_params[k].item()
-                p_true.append(t_val)
+                # p_true.append(t_val)
                 p_rec.append(r_val)
-                p_err.append(abs(t_val - r_val))
+                # p_err.append(abs(t_val - r_val))
 
                 # Check status
                 if k in active_keys:
@@ -564,12 +565,13 @@ def optimize_parallel_system(
 
 
 class Optimizer:
-    def __init__(self, data: dict, model: str | torch.Tensor) -> None:
+    def __init__(self, data: dict, model: Path | str) -> None:
         self.data = data
         self.simulations = []
+        self.model = Path(model)
         pass
 
-    def coarse_optimize(self):
+    def coarse_optimize(self, **kwargs):
         """Coarse Optimize
 
         Optimization using MLP parallel execution
@@ -583,7 +585,7 @@ class Optimizer:
 
         # Create the instances of dataset for each node in the data.
 
-        optimize_parallel_machines(shared_data)
+        optimize_parallel_machines(shared_data,**kwargs)
 
         # Execute in parallel for each one of the nodes.
 

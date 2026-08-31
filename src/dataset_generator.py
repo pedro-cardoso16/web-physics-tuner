@@ -98,7 +98,7 @@ def execution(seed=None, **kwargs):
     n_nodes = rng.integers(3, 103, dtype=int)
     # anchor_point = rng.integers((0, 0), (500, 200))
     anchor_point = (0, 0)
-    step = rng.uniform(0.01, 1)  # base distance between consecutive nodes
+    step = rng.uniform(0.001, 1)  # base distance between consecutive nodes
     k = rng.uniform(0, 1)
     dampening_k = rng.uniform(0, 1)
     g = rng.uniform(0, 1)
@@ -124,8 +124,9 @@ def execution(seed=None, **kwargs):
     simulation.build_vectorized_constraints()
 
     data = []
-    for _ in range(kwargs.get("n", kwargs.get("n_iterations", 50))):
-        dt = float(rng.uniform(0.0001, 0.03))  # now it shouldn't break :)
+    n_iterations = kwargs.get("n_iterations", 50)
+    for _ in range(kwargs.get("n", n_iterations)):
+        dt = float(rng.uniform(0, 0.01))  # now it shouldn't break :)
         simulation.dt = dt
         simulation.run(n=1)
         properties = extract_nodes_properties(simulation)
@@ -186,6 +187,13 @@ def execution(seed=None, **kwargs):
                 # case "gravitational_force":
                 # k["g"][1] = (k["g"][1] - 100) / 500
 
+    file_path = kwargs.get("output_file", None)
+
+    if file_path:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        return n_nodes * n_iterations
+
     return data
 
 
@@ -208,6 +216,7 @@ def generate_dataset(
                 **{
                     "seed": simulation_seed,
                     "n_iterations": kwargs.get("n_iterations", 50),
+                    "output_file": Path(shard_dir) / f"sim_{sim_idx:06d}.json",
                 },
             )
             futures[future] = sim_idx
@@ -218,13 +227,15 @@ def generate_dataset(
             total=len(futures),
         ):
             sim_idx = futures[future]
-            records = future.result()  # only THIS simulation's records in memory
+            del futures[future]
+            n_records = future.result()  # only THIS simulation's records in memory
 
             shard_path = Path(shard_dir) / f"sim_{sim_idx:06d}.json"
-            with open(shard_path, "w", encoding="utf-8") as f:
-                json.dump(records, f)
+            # with open(shard_path, "w", encoding="utf-8") as f:
+            #     json.dump(records, f)
 
-            manifest.append({"shard": shard_path.name, "n_records": len(records)})
+            manifest.append({"shard": shard_path.name, "n_records": n_records})
+
             # `records` goes out of scope next loop iteration and gets GC'd
 
     with open(Path(shard_dir) / "manifest.json", "w") as f:
@@ -232,4 +243,5 @@ def generate_dataset(
 
 
 if __name__ == "__main__":
-    generate_dataset("data/shards", seed=1, n_simulations=5000, n_iterations=400, max_workers=4)
+    generate_dataset("data/shards", seed=1, n_simulations=10_000, n_iterations=500)
+    # generate_dataset("data/shards_test", seed=1, n_simulations=10, n_iterations=400, max_workers=2)

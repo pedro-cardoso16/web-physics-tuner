@@ -193,7 +193,7 @@ class VideoDataset(Dataset):
         n_nodes_normalized = data["n_nodes_normalized"]
 
         x, y = data["frames"][frame_index]["nodes"][node_index]
-        vx, vy = data["frames"][frame_index]["velocities"][node_index]
+        vx, vy = data["frames"][frame_index]["velocity"][node_index]
         dt = data["frames"][frame_index + 1]["dt"]  # dt into the future
         p = node_index / (n_nodes - 1)
         n = n_nodes_normalized
@@ -228,7 +228,7 @@ class VideoDataset(Dataset):
     @data.setter
     def data(self, x):
         self.__data = x
-        self.__n_nodes = self.data['n_nodes']
+        self.__n_nodes = self.data["n_nodes"]
         self.__n_nodes_normalized = self.data["n_nodes_normalized"]  # normalized
 
     @property
@@ -385,12 +385,16 @@ class MLP(nn.Module):
                 p.requires_grad_(True)
         self.eval()
 
-    def get_hyperparameter_penalty(self) -> torch.Tensor:
+    def get_hyperparameter_penalty(self, multiplier: float = 1.0) -> torch.Tensor:
         """Computes a soft L2 penalty for any negative hyperparameters."""
         device = next(self.parameters()).device
         penalty = torch.tensor(0.0, device=device)
+
         for p in self.hyper_params.values():
             penalty += torch.sum(torch.relu(-p) ** 2)
+
+        penalty *= multiplier
+
         return penalty
 
     def save(self, filepath: str | Path) -> None:
@@ -431,6 +435,40 @@ class MLP(nn.Module):
                     )
                 else:
                     self.hyper_params[k].copy_(true_hp[i])
+
+        # Freeze network parameters and exclude non-optimized variables from backpropagation
+        exclude_keys = [k for k in HP_KEYS if k not in optimize_keys]
+        self.freeze_network(exclude_hps=exclude_keys)
+
+    def setup_hyperparameters_tuning(
+        self,
+        optimize_keys: list[str] | None = None,
+        initial_val: float | dict[str, float] | torch.Tensor | list[float] = 0.5,
+    ) -> None:
+        """
+        Set up coarse optimization in a single call.
+        Fills frozen parameters with their true values, initializes optimized parameters
+        to initial_val, and configures requires_grad on parameters accordingly.
+        If optimize_keys is empty or not given, optimizes all parameters.
+        """
+        if not optimize_keys:
+            optimize_keys = list(HP_KEYS)
+
+        with torch.no_grad():
+            for i, k in enumerate(HP_KEYS):
+                if k in optimize_keys:
+                    # Assign the correct starting value format
+                    if isinstance(initial_val, dict):
+                        val = initial_val.get(k, 0.5)
+                    elif isinstance(initial_val, (list, tuple, torch.Tensor)):
+                        val = initial_val[i]
+                    else:
+                        val = initial_val
+                    self.hyper_params[k].copy_(
+                        torch.as_tensor(val, dtype=torch.float32)
+                    )
+                # else:
+                #     self.hyper_params[k].copy_(true_hp[i])
 
         # Freeze network parameters and exclude non-optimized variables from backpropagation
         exclude_keys = [k for k in HP_KEYS if k not in optimize_keys]
@@ -490,7 +528,7 @@ if __name__ == "__main__":
         train_dataset = ShardedRopeDataset(
             shard_dir, shard_names=[s["shard"] for s in train_shards]  # type: ignore
         )
-        train_loader = DataLoader(train_dataset, batch_size=32, num_workers=16)
+        train_loader = DataLoader(train_dataset, batch_size=8192, num_workers=16)
 
         model.freeze_hyperparams()
         optimizer1 = torch.optim.Adam(
