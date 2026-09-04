@@ -1,7 +1,7 @@
 import numpy as np
 import sys
 import pandas as pd
-from tools import rotate_particles
+from src.utils.tools import rotate_particles
 from pathlib import Path
 
 # from copy import deepcopy
@@ -9,7 +9,7 @@ import json
 import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
-from physics import (
+from src.engine.physics import (
     Simulation,
     Particle,
     make_torsion_spring_constraint,
@@ -17,7 +17,7 @@ from physics import (
     make_elastic_constraint,
     make_gravitational_constraint,
 )
-from presets import (
+from src.engine.presets import (
     create_string,
     create_fibonacci_spiral_string,
     create_curling_string,

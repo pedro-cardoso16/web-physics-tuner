@@ -88,8 +88,8 @@ def preprocess_and_skeletonize(img, thresh=None):
         binary_cleaned = img_binary_cleaned
 
     # Generate skeleton
-    img_skeleton = cv.ximgproc.thinning(
-        binary_cleaned, thinningType=cv.ximgproc.THINNING_ZHANGSUEN
+    img_skeleton = cv.ximgproc.thinning( # type: ignore
+        binary_cleaned, thinningType=cv.ximgproc.THINNING_ZHANGSUEN # type: ignore
     )
     return img_skeleton
 

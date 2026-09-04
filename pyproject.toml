@@ -5,6 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wpt"
 version = "0.1.0"
+dynamic = ["dependencies"]
 
-[tool.setuptools.package-dir]
-"wpt" = "src"
+# Tell setuptools exactly which package to look for
+[tool.setuptools.packages.find]
+include = ["wpt*"]  # Strictly force it to only discover the wpt package
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }

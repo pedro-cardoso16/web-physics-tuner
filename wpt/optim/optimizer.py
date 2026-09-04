@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import pandas as pd
-from model import MLP, TrainDataset, HP_KEYS, pick_shard_with_all_forces
+from wpt.nn.model import MLP, TrainDataset, HP_KEYS, pick_shard_with_all_forces
 
 def fit_hyperparams_single_node(
     model: MLP,

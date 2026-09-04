@@ -3,7 +3,7 @@ import orjson
 from pathlib import Path
 import torch
 from tqdm import tqdm
-from model import record_to_input, merge_hp
+from wpt.nn.model import record_to_input, merge_hp
 
 def pre_compile_dataset(shard_dir: str, output_file: str):
     shard_paths = sorted(Path(shard_dir).glob("sim_*.json"))

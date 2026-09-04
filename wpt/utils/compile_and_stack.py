@@ -7,7 +7,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import torch
 import numpy as np
 from tqdm import tqdm
-from model import record_to_input, merge_hp
+from wpt.nn.model import record_to_input, merge_hp
 
 
 def compile_single_shard(json_path: Path, temp_pt_dir: Path):

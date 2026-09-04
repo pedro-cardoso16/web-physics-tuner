@@ -222,3 +222,6 @@ playground.py
 
 # Large files
 data/shards/
+
+# Temporary
+tmp/

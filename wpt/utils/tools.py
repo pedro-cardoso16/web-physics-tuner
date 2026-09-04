@@ -2,9 +2,9 @@ import numpy as np
 import pandas as pd
 import json
 import os
-from physics import Particle
+from src.engine.physics import Particle
 from numpy.typing import ArrayLike
-from physics import Simulation, Particle
+from src.engine.physics import Simulation, Particle
 
 
 def rotate_particles(*args: Particle, pivot: np.ndarray, angle_rad: float) -> None:
@@ -96,7 +96,7 @@ def show_trajectory(
     xy_max,
     **kwargs
 ):
-    from game import run_engine_with_multiple_predefined_chain_paths
+    from src.engine.game import run_engine_with_multiple_predefined_chain_paths
 
     normalized_data = denormalize_data(
         data, original_resolution, new_resolution, xy_max, xy_min
@@ -111,7 +111,7 @@ def show_trajectory(
 
 
 def get_metadata_from_file(file_path) -> dict:
-    from model import VideoDataset
+    from wpt.nn.model import VideoDataset
 
     data = VideoDataset.load_data(file_path)
     dts = []
@@ -150,10 +150,10 @@ def get_metadata_from_file(file_path) -> dict:
 
 
 def show_chain_trajectory(file_path: str | Path):
-    from model import VideoDataset
+    from wpt.nn.model import VideoDataset
 
     # from physics import Simulation
-    from game import (
+    from src.engine.game import (
         run_engine,
         draw_connections,
         run_engine_with_predefined_chain_path,
@@ -198,7 +198,7 @@ from collections.abc import Iterable
 def denormalize_data(
     data: Iterable, original_resolution, new_resolution, xy_max, xy_min
 ):
-    from game import zoom_transform
+    from src.engine.game import zoom_transform
 
     xy_range = np.array(xy_max) - np.array(xy_min)
 
@@ -232,7 +232,7 @@ def simulate_chain_from_file(
 ) -> np.ndarray:
     data = pd.read_json(file_path)
 
-    from physics import (
+    from src.engine.physics import (
         Particle,
         make_dampening_constraint,
         make_elastic_constraint,
@@ -356,7 +356,7 @@ if __name__ == "__main__":
         gt_metadata["xy_min"],
     )
 
-    from game import run_engine_with_multiple_predefined_chain_paths
+    from src.engine.game import run_engine_with_multiple_predefined_chain_paths
 
     run_engine_with_multiple_predefined_chain_paths(
         [data, ground_truth_coords], dts=[1] * len(data), loop=True, framerate=600

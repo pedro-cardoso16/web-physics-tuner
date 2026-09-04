@@ -2,7 +2,7 @@ import orjson
 from pathlib import Path
 import torch
 from tqdm import tqdm
-from model import record_to_input, merge_hp
+from wpt.nn.model import record_to_input, merge_hp
 
 def compile_shards_incrementally(json_dir: str, pt_dir: str):
     json_paths = sorted(Path(json_dir).glob("sim_*.json"))

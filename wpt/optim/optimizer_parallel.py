@@ -3,15 +3,15 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import pandas as pd
-from model import MLP, TrainDataset, VideoDataset, HP_KEYS, pick_shard_with_all_forces
-from physics import (
+from wpt.nn.model import MLP, TrainDataset, VideoDataset, HP_KEYS, pick_shard_with_all_forces
+from src.engine.physics import (
     Simulation,
     Particle,
     make_gravitational_constraint,
     make_elastic_constraint,
     make_torsion_spring_constraint,
 )
-from presets import create_string
+from src.engine.presets import create_string
 
 from concurrent.futures import ProcessPoolExecutor
 
@@ -610,7 +610,7 @@ class Optimizer:
 
         """
 
-        from model import VideoDataset
+        from wpt.nn.model import VideoDataset
 
         shared_data = VideoDataset.load_data("output_normalized.json")
 
@@ -709,20 +709,20 @@ def fit_hyper_parameters(
 
     from torch.nn.functional import mse_loss
 
-    optim = torch.optim.Adam()
-    simulation.build_vectorized_constraints()
+    # optim = torch.optim.Adam()
+    # simulation.build_vectorized_constraints()
 
-    for i in range(n_frames):
-        input_val = simulation.particles.x
-        simulation.run(n=1)
-        from dataset_generator import extract_nodes_properties
-        target = simulation.particles.x
-        loss += mse_loss(input=,target=target)
+    # for i in range(n_frames):
+    #     input_val = simulation.particles.x
+    #     simulation.run(n=1)
+    #     from dataset_generator import extract_nodes_properties
+    #     target = simulation.particles.x
+    #     loss += mse_loss(input=,target=target)
 
 
-    loss.backward()
-    optim.step()
-    optim.zero_grad()
+    # loss.backward()
+    # optim.step()
+    # optim.zero_grad()
 
 
 
