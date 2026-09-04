@@ -46,7 +46,7 @@ def create_mesh(
     **kwargs,
 ):
     """
-    
+
     Args:
         simulation (Simulation): target simulation object to add the mesh.
         top_left (tuple | list | np.ndarray): position of the top-left mesh node.
@@ -54,12 +54,12 @@ def create_mesh(
         h (int): height, number of vertical nodes
         step (float | np.ndarray): distance between nodes
 
-        kwargs (Any): additional params to set for the forces 
-            * m (float): nodes' mass
-            * k (float): elastic constant
-            * dr (float): rest distance for elastic force
-            * a (float): first order dampening parameter
-            * b (float): second order dampening parameter
+        kwargs (Any): additional params to set for the forces
+            - m (float | ArrayLike): nodes' mass
+            - k (float | ArrayLike): elastic constant
+            - dr (float | ArrayLike): rest distance for elastic force
+            - a (float): first order dampening parameter
+            - b (float): second order dampening parameter
     """
     top_left = np.array(top_left)
 
@@ -90,12 +90,12 @@ def create_mesh(
 
         # Gravity on all non-pivot particles
         gravitational_constraint = make_gravitational_constraint(
-            particle, kwargs.get("g", np.array([0, 500]))
+            particle, kwargs.get("g", np.array([0, 1]))
         )
         particle.constraints.append(gravitational_constraint)
 
         # Dampening
-        dampening_k = kwargs.get("dampening", 0.02)
+        dampening_k = kwargs.get("dampening", 0.0)
         particle.constraints.append(make_dampening_constraint(particle, dampening_k))
 
         # Mesh Connectivity: connect to left and top neighbors to build the grid
@@ -105,29 +105,39 @@ def create_mesh(
             dr = kwargs.get("dr", step_x)
             # Add constraint to current particle
             particle.constraints.append(
-                make_elastic_constraint(particle, left_neighbor, k, dr)
+                make_elastic_constraint(particle, left_neighbor, kwargs.get("k", k), dr)
             )
 
             # Only add reverse constraint to neighbor if neighbor is NOT a pivot (row 0)
             neighbor_row = row
             if neighbor_row != 0:
                 left_neighbor.constraints.append(
-                    make_elastic_constraint(left_neighbor, particle, k, dr)
+                    make_elastic_constraint(
+                        left_neighbor, particle, kwargs.get("k", k), dr
+                    )
                 )
 
         # Connect to Top neighbor (same x, previous y)
         if row > 0:
             top_neighbor = particles[col * h + (row - 1)]
             dr = kwargs.get("dr", step_y)
+
+            try: 
+                k_val = kwargs.get("k", k)[row - 1]
+            except:
+                k_val = k
+
             particle.constraints.append(
-                make_elastic_constraint(particle, top_neighbor, k, dr)
+                make_elastic_constraint(particle, top_neighbor, k_val, dr)
             )
 
             # Only add reverse constraint if top neighbor is NOT a pivot (row 0)
             neighbor_row = row - 1
             if neighbor_row != 0:
                 top_neighbor.constraints.append(
-                    make_elastic_constraint(top_neighbor, particle, k, dr)
+                    make_elastic_constraint(
+                        top_neighbor, particle, k_val, dr
+                    )
                 )
 
     # simulation.particles.extend(particles)
@@ -146,6 +156,7 @@ def create_string(
     particles = create_mesh(simulation, anchor, 1, n, step, k, **kwargs)
 
     return particles
+
 
 def create_fibonacci_spiral_string(
     simulation: Simulation,

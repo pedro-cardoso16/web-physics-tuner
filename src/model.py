@@ -3,12 +3,14 @@ import random
 import logging
 from pathlib import Path
 from typing import Any, Iterator
+import numpy as np  # Fixed: Imported numpy natively for memmap support! [2]
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
-
+from typing import Literal
 HP_KEYS = (
+    # "m",
     "g",
     "dampening_k",
     "elastic_k_1",
@@ -246,10 +248,6 @@ class VideoDataset(Dataset):
         return self.input_data[index], self.label[index]
 
 
-import random
-from torch.utils.data import IterableDataset, get_worker_info
-
-
 class BufferedPtDataset(IterableDataset):
     """
     Hybrid Dataset: Keeps a small buffer of pre-compiled .pt files in memory.
@@ -314,67 +312,155 @@ class BufferedPtDataset(IterableDataset):
             # and is immediately garbage-collected, keeping your RAM flat!
 
 
-import numpy as np
-import torch
-from torch.utils.data import Dataset
-from pathlib import Path
-import json
-
-class MappedRopeDataset(Dataset):
+class MappedRopeDataset(IterableDataset):
     """
-    Hybrid, High-Performance Dataset.
+    The Ultimate Self-Healing Hybrid Dataset.
     - Stored safely as binary files on disk.
-    - Pre-loads the ENTIRE compiled dataset directly into your 32 GB of RAM on 
-      startup to maximize training speed (uses exactly ~2.0 GB of RAM) [1].
-    - If your dataset grows past your RAM in the future, set load_to_ram=False
-      to run directly from your SSD memory-map! [1]
+    - Supports three modes: 'all' (100% RAM cache), 'disk' (0% RAM, direct SSD read),
+      and 'window' (rolling window cache) [1].
+    - If load_to_ram=True is passed, it automatically runs in 'all' mode [1].
+    - In 'window' mode, it dynamically queries your system's available RAM. If available
+      memory falls below 15%, it automatically shrinks 'self.window_fraction' on-the-fly [1].
     """
-    def __init__(self, pt_dir: str, load_to_ram: bool = True) -> None:
+
+    def __init__(
+        self,
+        pt_dir: str,
+        mode: str = "window",
+        window_fraction: float = 0.2,
+        shuffle: bool = True,
+        load_to_ram: bool = True,
+    ) -> None:
         super().__init__()
         pt_path = Path(pt_dir)
-        
+
         # Load total records count N from metadata
         with open(pt_path / "metadata.json") as f:
             N = json.load(f)["total_records"]
-            
+
         self.N = N
-        self.load_to_ram = load_to_ram
-        
+        self.shuffle = shuffle
+        self.window_fraction = window_fraction
+
+        # Map the binary files directly from your SSD (Read-only mode)
+        self.data_mmap = np.memmap(
+            pt_path / "data.bin", dtype="float32", mode="r", shape=(N, 7)
+        )
+        self.hp_mmap = np.memmap(
+            pt_path / "hp.bin", dtype="float32", mode="r", shape=(N, 12)
+        )
+        self.label_mmap = np.memmap(
+            pt_path / "label.bin", dtype="float32", mode="r", shape=(N, 2)
+        )
+
+        # Handle legacy parameters to prevent breaking changes
         if load_to_ram:
-            print(f"Pre-loading {N} records (approx 2.0 GB) directly into your 32 GB RAM...")
-            # 1. Map the files temporarily to copy their raw binary data
-            raw_data = np.memmap(pt_path / "data.bin", dtype="float32", mode="r", shape=(N, 7))
-            raw_hp = np.memmap(pt_path / "hp.bin", dtype="float32", mode="r", shape=(N, 12))
-            raw_label = np.memmap(pt_path / "label.bin", dtype="float32", mode="r", shape=(N, 2))
-            
-            # 2. Copy them directly into RAM as native, contiguous PyTorch Tensors
-            self.data = torch.from_numpy(raw_data.copy())
-            self.hp = torch.from_numpy(raw_hp.copy())
-            self.label = torch.from_numpy(raw_label.copy())
-            
-            # 3. Delete the temporary memmaps to free file handles
-            del raw_data, raw_hp, raw_label
-            print("Dataset fully cached in RAM. No disk I/O will occur during training!")
-            
+            self.mode = "all"
         else:
-            print(f"Memory-mapping {N} records from {pt_dir} (reading directly from SSD on-demand)...")
-            self.data_mmap = np.memmap(pt_path / "data.bin", dtype="float32", mode="r", shape=(N, 7))
-            self.hp_mmap = np.memmap(pt_path / "hp.bin", dtype="float32", mode="r", shape=(N, 12))
-            self.label_mmap = np.memmap(pt_path / "label.bin", dtype="float32", mode="r", shape=(N, 2))
+            self.mode = mode.lower()
 
-    def __len__(self) -> int:
-        return self.N
+        # If the user chooses 'all', we pre-load everything once on startup
+        if self.mode == "all":
+            print(
+                f"Mode [ALL]: Pre-loading all {N} records (approx 2.0 GB) directly into RAM..."
+            )
+            self.data_ram = torch.from_numpy(self.data_mmap.copy())
+            self.hp_ram = torch.from_numpy(self.hp_mmap.copy())
+            self.label_ram = torch.from_numpy(self.label_mmap.copy())
+            print("Dataset fully cached in RAM. Zero disk latency.")
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.load_to_ram:
-            # Instantaneous RAM read (Buttery smooth, maximum hardware speed)
-            return self.data[index], self.hp[index], self.label[index]
+    def _check_memory_and_adjust(self) -> None:
+        """Queries the system's virtual memory and dynamically shrinks the window if RAM is low."""
+        try:
+            import psutil
+
+            vm = psutil.virtual_memory()
+            available_percent = vm.available / vm.total  # e.g., 0.08 for 8%
+
+            # If available RAM falls below 15%, dynamically scale down the window size
+            if available_percent < 0.15:
+                old_fraction = self.window_fraction
+                # Scale down by 30%, with a hard minimum limit of 1% (0.01)
+                self.window_fraction = max(0.01, self.window_fraction * 0.7)
+                print(
+                    f"\n[StarchVSE WARNING] Low system memory detected: {available_percent*100:.1f}% available.\n"
+                    f"Dynamically reducing window_fraction from {old_fraction*100:.1f}% to {self.window_fraction*100:.1f}% to prevent OOM crash!"
+                )
+        except ImportError:
+            # Fallback if psutil is not installed
+            pass
+
+    def __iter__(self):
+        # --- MODE A: NATIVE MEMORY-MAPPED SSD READING (0% RAM Cache) ---
+        if self.mode == "disk":
+            order = list(range(self.N))
+            if self.shuffle:
+                random.shuffle(order)
+            for idx in order:
+                x = torch.from_numpy(self.data_mmap[idx].copy())
+                hp = torch.from_numpy(self.hp_mmap[idx].copy())
+                y = torch.from_numpy(self.label_mmap[idx].copy())
+                yield x, hp, y
+            return
+
+        # --- MODE B: 100% RAM CACHE (Fastest, zero disk latency) ---
+        if self.mode == "all":
+            order = list(range(self.N))
+            if self.shuffle:
+                random.shuffle(order)
+            for idx in order:
+                yield self.data_ram[idx], self.hp_ram[idx], self.label_ram[idx]
+            return
+
+        # --- MODE C: THE SELF-HEALING ROLLING WINDOW CACHE (Dynamic Pointer Loop) ---
+        # Split the dataset into continuous sectors per worker
+        info = get_worker_info()
+        if info is None:
+            start_ptr = 0
+            end_ptr = self.N
         else:
-            # Direct SSD read fallback (Uses 0 MB of RAM if dataset exceeds memory)
-            x = torch.from_numpy(self.data_mmap[index].copy())
-            hp = torch.from_numpy(self.hp_mmap[index].copy())
-            y = torch.from_numpy(self.label_mmap[index].copy())
-            return x, hp, y
+            sector_size = self.N // info.num_workers
+            start_ptr = info.id * sector_size
+            end_ptr = (
+                (info.id + 1) * sector_size
+                if info.id < info.num_workers - 1
+                else self.N
+            )
+
+        current_ptr = start_ptr
+
+        while current_ptr < end_ptr:
+            # 1. Check system RAM before loading the next chunk
+            self._check_memory_and_adjust()
+
+            # 2. Calculate the next chunk size dynamically
+            chunk_size = int(self.N * self.window_fraction)
+            # Clamp chunk size so we don't read past our designated worker boundaries
+            chunk_size = max(100, min(chunk_size, end_ptr - current_ptr))
+
+            end_chunk = current_ptr + chunk_size
+
+            # 3. Load only this specific slice of the binary files into RAM
+            chunk_data = torch.from_numpy(self.data_mmap[current_ptr:end_chunk].copy())
+            chunk_hp = torch.from_numpy(self.hp_mmap[current_ptr:end_chunk].copy())
+            chunk_label = torch.from_numpy(
+                self.label_mmap[current_ptr:end_chunk].copy()
+            )
+
+            # 4. Shuffle the data internally within this active window
+            order = list(range(chunk_size))
+            if self.shuffle:
+                random.shuffle(order)
+
+            for idx in order:
+                yield chunk_data[idx], chunk_hp[idx], chunk_label[idx]
+
+            # 5. Advance our pointer to the next block
+            current_ptr = end_chunk
+
+            # 6. EXPLICIT MEMORY CLEANUP
+            del chunk_data, chunk_hp, chunk_label
+
 
 class InMemoryRopeDataset(Dataset):
     """
@@ -688,7 +774,12 @@ if __name__ == "__main__":
         val_shards = manifest[:n_val]
         train_shards = manifest[n_val:]
 
-    model = MLP()
+    # DETECT SYSTEM HARDWARE (Activate CUDA/GPU support if available!) [1]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Active Hardware Device: {device}")
+
+    # Move your model to the selected hardware [1]
+    model = MLP().to(device)
 
     # --- check for existing trained checkpoint to save time ---
     if model_checkpoint_path.exists():
@@ -696,34 +787,51 @@ if __name__ == "__main__":
             f"Loading pre-trained Phase 1 model checkpoint from '{model_checkpoint_path}'..."
         )
         model.load(model_checkpoint_path)
+        model = model.to(device)  # Ensure loaded model is on correct hardware [1]
     else:
         print("No checkpoint found. Starting Phase 1 training...")
         # --- phase 1: train the network across many rope instances ---
 
-        # ALTERATION 1: Point directly to your pre-compiled binary .pt shards directory
+        # Point directly to your pre-compiled binary .pt shards directory [2]
         pt_dir = Path("data/pt_shards")
 
+        BATCH_SIZE = int(2**19)
+
+        # Caches your pre-compiled binary dataset into your 32 GB RAM [1]
         train_dataset = MappedRopeDataset(
-            pt_dir, load_to_ram=True  # type: ignore
+            pt_dir, window_fraction=0.15, load_to_ram=False  # type: ignore
         )
 
-        # ALTERATION 2: Removed shuffle=True because BufferedPtDataset is an IterableDataset.
-        # (Shuffling is handled internally by the dataset's memory buffer!)
-        train_loader = DataLoader(train_dataset, batch_size=1024, num_workers=4)
+        total_batches = (train_dataset.N + BATCH_SIZE - 1) // BATCH_SIZE
+
+        # Removed shuffle=True (since MappedRopeDataset is now an IterableDataset) [1]
+        # Added pin_memory=True for fast, asynchronous GPU (PCIe) transfers! [1.1.2]
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True,
+        )
 
         model.freeze_hyperparams()
         optimizer1 = torch.optim.Adam(
-            [p for p in model.parameters() if p.requires_grad], lr=1e-3
+            [p for p in model.parameters() if p.requires_grad], lr=1e-2
         )
 
-        n_epochs = 100
+        n_epochs = 1
         epoch_bar = tqdm(range(n_epochs), desc="Phase 1 (train)", unit="epoch")
         for epoch in epoch_bar:
             total_loss, n_batches = 0.0, 0
             batch_bar = tqdm(
-                train_loader, desc=f"epoch {epoch}", unit="batch", leave=False
+                train_loader, desc=f"epoch {epoch}", unit="batch", total=total_batches
             )
             for x_batch, hp_batch, y_batch in batch_bar:
+                # non_blocking=True overlaps the PCIe memory transfer with GPU computing! [1.1.1, 1.1.2]
+                x_batch = x_batch.to(device, non_blocking=True)
+                hp_batch = hp_batch.to(device, non_blocking=True)
+                y_batch = y_batch.to(device, non_blocking=True)
+
                 pred = model(x_batch, hp=hp_batch)
                 loss = nn.functional.mse_loss(pred, y_batch)
                 optimizer1.zero_grad()
@@ -747,6 +855,9 @@ if __name__ == "__main__":
     # We follow ONLY ONE specific node (node_idx=-1 corresponds to the free end / tip)
     # Because of the updated order, self.hp correctly maps inactive local parameters to 0.0
     real_dataset = TrainDataset(real_records, node_idx=2)
+
+    # Ensure the model is mapped to the GPU for Phase 2 optimization [1]
+    model = model.to(device)
     real_loader = DataLoader(real_dataset, batch_size=len(real_dataset), shuffle=True)
 
     # --- Phase 2 Configuration: ONE-LINER SETUP ---
@@ -767,10 +878,14 @@ if __name__ == "__main__":
         [p for p in model.parameters() if p.requires_grad], lr=1e-3
     )
 
-    n_steps = 1000
+    n_steps = 10_000
     step_bar = tqdm(range(n_steps), desc="Phase 2 (hp fit)", unit="step")
     for step in step_bar:
         for x_batch, _hp_ignored, y_batch in real_loader:
+            # Send Phase 2 inputs and labels to the GPU! [1]
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+
             pred = model(x_batch, hp=None)
             mse_loss = nn.functional.mse_loss(pred, y_batch)
 

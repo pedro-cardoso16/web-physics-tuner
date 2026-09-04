@@ -1,13 +1,26 @@
 import pygame as pg
 from physics import *
+from typing import Literal, Iterable
 
 PARTICLE_RADIUS = 3
 
 # Color Defs
 BLACK = (0, 0, 0)
 WHITE = (255, 255, 255)
-
+BLUE = (0, 0, 255)
 pg.init()
+
+
+def draw_dots(*coords, screen: pg.Surface, **kwargs):
+    default_kwargs = {
+        "color": BLUE,
+        "radius": PARTICLE_RADIUS,
+    }
+
+    kwargs = default_kwargs | kwargs
+
+    for coord in coords:
+        pg.draw.circle(screen, WHITE, coord, PARTICLE_RADIUS)
 
 
 def draw_particle(particle: Particle, screen: pg.Surface) -> None:
@@ -18,10 +31,44 @@ def draw_connection(particle1, particle2, screen: pg.Surface) -> None:
     pg.draw.polygon(screen, WHITE, (particle1.x, particle2.x), width=1)
 
 
-def run_engine(simulation: Simulation, width: int = 800, height: int = 500):
+def draw_connections(
+    *coords,
+    screen: pg.Surface,
+    mode: Literal["sequential", "all"] = "sequential",
+    **kwargs
+):
+    default_kwargs = {
+        "color": WHITE,
+        "width": 1,
+    }
+
+    kwargs = default_kwargs | kwargs
+
+    n_coords = len(coords)
+
+    if mode == "sequential":
+        for i in range(n_coords - 1):
+            pg.draw.polygon(
+                screen, WHITE, (coords[i], coords[i + 1]), width=kwargs["width"]
+            )
+
+        return
+
+    if mode == "all":
+        for i in range(n_coords - 1):
+            for j in range(i + 1, n_coords):
+                pg.draw.polygon(
+                    screen, WHITE, (coords[i], coords[j]), width=kwargs["width"]
+                )
+        return
+
+
+def run_engine(simulation: Simulation, width: int = 800, height: int = 500, **kwargs):
     # start_time = time.perf_counter()
     running = True
     accumulator = 0.0
+
+    connections: set[frozenset[Particle]] = kwargs.get("connections", set())
 
     while running:
         for event in pg.event.get():
@@ -36,24 +83,120 @@ def run_engine(simulation: Simulation, width: int = 800, height: int = 500):
             simulation.run(n=1)
             accumulator -= simulation.dt
 
-        # Draw connections
-        # for i in range(1, len(particles)):
-        #     p = particles[i]
-        #     col = i // h
-        #     row = i % h
-        #     if col > 0:
-        #         draw_connection(p, particles[(col - 1) * h + row], screen)
-        #     if row > 0:
-        #         draw_connection(p, particles[col * h + (row - 1)], screen)
-
         # Draw particles
-        for particle in simulation.particles:
-            draw_particle(particle, screen)
+        # for particle in simulation.particles:
+        #     draw_particle(particle, screen)
+
+        positions = (particle.x for particle in simulation.particles)
+        draw_dots(*positions, screen=screen)
+
+        for c in connections:
+            c = tuple(c)
+            draw_connection(c[0], c[1], screen=screen)
 
         pg.display.flip()
 
     pg.quit()
-    
+
+
+def run_engine_with_predefined_chain_path(coords: Iterable, dts: list, **kwargs):
+    # start_time = time.perf_counter()
+    running = True
+    accumulator = 0.0
+
+    while running:
+        for c, dt in zip(coords, dts):
+            for event in pg.event.get():
+                if event.type == pg.QUIT:
+                    running = False
+
+            if not running:
+                break
+
+            screen.fill(BLACK)
+            frame_time = clock.tick(60) / 1000.0
+            accumulator += frame_time
+
+            while accumulator > dt:
+                accumulator -= dt
+
+            draw_connected_chain(*c, screen=screen)
+
+            pg.display.flip()
+
+
+        if not kwargs.get("loop", False) or not running:
+            break
+
+    pg.quit()
+
+
+from collections.abc import Iterable
+
+# import pygame as pg
+
+
+def run_engine_with_multiple_predefined_chain_paths(
+    coords: list[Iterable], dts: list, **kwargs
+):
+    """
+    Runs the Pygame engine, drawing any number of predefined chain paths
+    simultaneously, synchronized by frame delta-times.
+
+    Args:
+        coords: A list of coordinate iterables, e.g., [coords1, coords2, coords3]
+        dts: A list of frame delta-times (seconds)
+        kwargs: Optional arguments (e.g., loop=True)
+    """
+    running = True
+    accumulator = 0.0
+
+    while running:
+        # zip(*coords, dts) unpacks the list of coordinates to match your dts
+        for *chains, dt in zip(*coords, dts):
+
+            # Handle Pygame events
+            for event in pg.event.get():
+                if event.type == pg.QUIT:
+                    running = False
+                    break  # Break out of the event loop
+
+            if not running:
+                break
+                        
+            # Clear screen and draw background
+            screen.fill(BLACK)
+
+            # Tick the clock and accumulate time
+            frame_time = clock.tick(kwargs.get('framerate', 60)) / 1000.0
+            accumulator += frame_time
+
+            # Step the simulation accumulator
+            while accumulator > dt:
+                accumulator -= dt
+
+            # Draw every active chain for this frame
+            for chain in chains:
+                draw_connected_chain(*chain, screen=screen)
+
+            pg.display.flip()
+
+        if not kwargs.get("loop", False) or not running:
+            break
+
+    pg.quit()
+
+
+def zoom_transform(*coords: ArrayLike, zoom_factor: float | ArrayLike):
+
+    new_coords = np.array(coords) * zoom_factor
+
+    return new_coords
+
+
+def draw_connected_chain(*coords: ArrayLike, screen: pg.Surface, **kwargs):
+    draw_dots(*coords, screen=screen, **kwargs)
+    draw_connections(*coords, screen=screen, mode="sequential")
 
 
 # Setup Screen Configuration
@@ -163,10 +306,14 @@ if __name__ == "__main__":
             simulation.run(n=1)
             accumulator -= simulation.dt
 
-        for particle in simulation.particles:
-            draw_particle(particle, screen)
+        # for particle in simulation.particles:
+        #     draw_particle(particle, screen)
 
-        draw_connection(particle1, particle2, screen)
-        draw_connection(particle3, particle2, screen)
-        draw_connection(particle4, particle3, screen)
+        # draw_connection(particle1, particle2, screen)
+        # draw_connection(particle3, particle2, screen)
+        # draw_connection(particle4, particle3, screen)
+
+        draw_connected_chain(
+            particle1.x, particle2.x, particle3.x, particle4.x, screen=screen
+        )
         pg.display.flip()

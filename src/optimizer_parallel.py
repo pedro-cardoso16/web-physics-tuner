@@ -239,6 +239,7 @@ def optimize_parallel_machines(
 
     pd.set_option("display.float_format", lambda v: f"{v:.6f}")
 
+    data_to_save = []
     for i in range(n):
         print(f"\n>>> Node {i} parameter discovery:")
         if i == 0:
@@ -283,7 +284,28 @@ def optimize_parallel_machines(
                 "status": p_status,
             }
         )
+
+        data_to_save.append({k: v for k, v in zip(HP_KEYS, p_rec)})
+
+
+        for idx in range(len(data_to_save)):
+            data_to_save[idx]['x0'] = x_all[idx][0][:2].tolist()
+            data_to_save[idx]['v0'] = x_all[idx][0][3:5].tolist()
+
+
         print(node_df.to_string(index=False))
+
+    metadata_to_save = {}
+    metadata_to_save['x'] = [x_all[i][:,:2].tolist() for i in range(n)]
+    metadata_to_save['v'] = [x_all[i][:,3:5].tolist() for i in range(n)]
+    metadata_to_save['dt'] = [d[-1].tolist() for d in datasets[0].input_data]
+
+    if output_file:
+        with open(output_file, "w") as f:
+            json.dump(data_to_save, f, indent=2)
+
+        with open(output_file.removesuffix('.json') + "_metadata.json", "w") as f:
+            json.dump(metadata_to_save, f, indent=2)
 
     # endregion
 
@@ -574,7 +596,17 @@ class Optimizer:
     def coarse_optimize(self, **kwargs):
         """Coarse Optimize
 
-        Optimization using MLP parallel execution
+        Optimization using MLP parallel execution. This represents the first
+        optimization step
+
+        Args:
+            model (Path | str): Path to the trained model.
+
+            device (str): PyTorch device. Defaults to `"cpu"`.
+
+            lr (float): Learning rate. Defaults to `0.001`.
+
+            output_file (str | Path): File to output results. Defaults to `None`.
 
         """
 
@@ -582,14 +614,9 @@ class Optimizer:
 
         shared_data = VideoDataset.load_data("output_normalized.json")
 
-
         # Create the instances of dataset for each node in the data.
 
-        optimize_parallel_machines(shared_data,**kwargs)
-
-        # Execute in parallel for each one of the nodes.
-
-        pass
+        optimize_parallel_machines(shared_data, **kwargs)
 
     def fine_optimize(self, hyper_parameters: dict | None = None, n_frames: int = 10):
 
@@ -606,7 +633,7 @@ class Optimizer:
                 n_nodes,
                 1,
                 1,
-                **hyper_parameters,
+                # **hyper_parameters,
             )
 
             for j, particle in enumerate(particles):
@@ -624,13 +651,17 @@ class Optimizer:
         self.coarse_optimize()
         self.fine_optimize()
 
-
+from typing import Any
 def fit_hyper_parameters(
-    start_coords,
-    start_velocities,
+    start_coords: torch.Tensor | Any,
+    start_velocities: torch.Tensor | Any,
     simulation: Simulation | None,
     start_hyper_parameters: list[dict] = [{}],
 ):
+    """
+
+    Function responsible for the fine optimization process. Uses pytorch
+    """
     n_nodes = len(start_coords)
     if simulation is None:
         simulation = Simulation()
@@ -671,6 +702,37 @@ def fit_hyper_parameters(
 
         particle.constraints.extend(constraints)
 
+    import torch
+
+    # --- Simulation run with pytorch enabled ---
+    loss = torch.tensor([])
+
+    from torch.nn.functional import mse_loss
+
+    optim = torch.optim.Adam()
+    simulation.build_vectorized_constraints()
+
+    for i in range(n_frames):
+        input_val = simulation.particles.x
+        simulation.run(n=1)
+        from dataset_generator import extract_nodes_properties
+        target = simulation.particles.x
+        loss += mse_loss(input=,target=target)
+
+
+    loss.backward()
+    optim.step()
+    optim.zero_grad()
+
+
+
+
+    # --- Grad calculation ---
+
+
+
+
+
 
 if __name__ == "__main__":
     shard_dir = Path("data/shards")
@@ -688,9 +750,9 @@ if __name__ == "__main__":
         with open(shard_dir / "manifest.json") as f:
             manifest = json.load(f)
 
-        val_fraction = 0.1
+        val_fraction = 1
         n_val = max(1, int(len(manifest) * val_fraction))
-        val_shards = manifest[:n_val]
+        val_shards = manifest[2:n_val]
 
         real_shard_path = pick_shard_with_all_forces(shard_dir, val_shards)
 
@@ -698,8 +760,8 @@ if __name__ == "__main__":
         results = optimize_parallel_system(
             real_shard_path,
             lr=1e-3,
-            n_steps=3000,
-            lambda_consensus=10.0,
+            n_steps=10_000,
+            lambda_consensus=12.0,
             initial_val=OPTIMIZER_INITIAL_VALUES,
             exclude_from_optimization=KEYS_TO_FREEZE,  # Keep gravity frozen at its true value
         )

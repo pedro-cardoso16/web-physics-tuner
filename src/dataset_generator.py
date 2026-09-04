@@ -98,7 +98,7 @@ def execution(seed=None, **kwargs):
     n_nodes = rng.integers(3, 103, dtype=int)
     # anchor_point = rng.integers((0, 0), (500, 200))
     anchor_point = (0, 0)
-    step = rng.uniform(0.001, 1)  # base distance between consecutive nodes
+    step = rng.uniform(0.001, 5)  # base distance between consecutive nodes
     k = rng.uniform(0, 1)
     dampening_k = rng.uniform(0, 1)
     g = rng.uniform(0, 1)
@@ -154,16 +154,28 @@ def execution(seed=None, **kwargs):
 
         x_range = x_max - x_min
         y_range = y_max - y_min
+        total_range = max(x_max, y_max) - min(x_min, y_min)
 
-        for i, r in enumerate((x_range, y_range)):
-            if r == 0:
+        # Old normalization type
+        # for i, r in enumerate((x_range, y_range)):
+        #     if r == 0:
+        #         d["input"]["x"][i] = 0
+        #         d["target"][i] = 0
+        #         d["input"]["v"][i] = 0
+        #     else:
+        #         d["input"]["x"][i] /= r
+        #         d["target"][i] /= r
+        #         d["input"]["v"][i] /= r
+
+        for i in range(2):
+            if total_range == 0:
                 d["input"]["x"][i] = 0
                 d["target"][i] = 0
                 d["input"]["v"][i] = 0
             else:
-                d["input"]["x"][i] /= r
-                d["target"][i] /= r
-                d["input"]["v"][i] /= r
+                d["input"]["x"][i] /= total_range
+                d["target"][i] /= total_range
+                d["input"]["v"][i] /= total_range
 
         d["input"]["n"] = (d["input"]["n"] - 3) / 100
 
@@ -172,7 +184,7 @@ def execution(seed=None, **kwargs):
             match key:
                 case "elastic_force_1" | "elastic_force_2":
                     k["k"] = k["k"]
-                    k["dr"] = (k["dr"] - 0.01) / 0.99
+                    k["dr"] /= total_range
                 case "torsion_spring_outer_1":
                     # k["k"] /= 500
                     k["theta0"] /= 2 * np.pi
@@ -243,5 +255,5 @@ def generate_dataset(
 
 
 if __name__ == "__main__":
-    generate_dataset("data/shards", seed=1, n_simulations=10_000, n_iterations=500)
+    generate_dataset("data/shards", seed=1, n_simulations=200, n_iterations=200)
     # generate_dataset("data/shards_test", seed=1, n_simulations=10, n_iterations=400, max_workers=2)
