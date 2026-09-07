@@ -31,3 +31,6 @@
 - [ ] Focus on the NN architecture
 
 - [ ] Add mass to the possible hyper-parameters.
+
+
+I need to correctly dimension the hyperparameters values. Test different range values

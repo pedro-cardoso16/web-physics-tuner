@@ -1,4 +1,4 @@
-from physics import *
+from .physics import *
 from itertools import product
 
 
@@ -37,7 +37,6 @@ def get_neighbors(i: int, w: int, h: int) -> list[tuple[int, str]]:
 
 
 def create_mesh(
-    simulation: Simulation,
     top_left: tuple | list | np.ndarray,
     w: int,
     h: int,
@@ -146,20 +145,18 @@ def create_mesh(
 
 
 def create_string(
-    simulation: Simulation,
     anchor: tuple | list | np.ndarray,
     n: int,
     step: float | np.ndarray,
     k: float,
     **kwargs,
 ):
-    particles = create_mesh(simulation, anchor, 1, n, step, k, **kwargs)
+    particles = create_mesh(anchor, 1, n, step, k, **kwargs)
 
     return particles
 
 
 def create_fibonacci_spiral_string(
-    simulation: Simulation,
     center: tuple | list | np.ndarray,
     n: int,
     k: float,
@@ -235,15 +232,14 @@ def create_fibonacci_spiral_string(
 
     return particles
 
-
+from collections.abc import Iterable
 def create_curling_string(
-    simulation: Simulation,
     anchor: tuple | list | np.ndarray,
     n: int,
     step: float | np.ndarray,
     k: float,
-    theta0: float,
-    torsion_k: float,
+    theta0: float | Iterable,
+    torsion_k: float | Iterable,
     **kwargs,
 ):
     """
@@ -265,17 +261,24 @@ def create_curling_string(
     Returns:
         list[Particle]: particles ordered from anchor outward
     """
-    particles = create_string(simulation, anchor, n, step, k, **kwargs)
+    particles = create_string(anchor, n, step, k, **kwargs)
 
     epsilon = kwargs.get("epsilon", 1e-4)
 
-    for i in range(1, n - 1):
+    # Ensure theta0 and torsion_k are iterable
+    if isinstance(theta0, (float, int)):
+        theta0 = [theta0] * (n - 2)
+    if isinstance(torsion_k, (float, int)):
+        torsion_k = [torsion_k] * (n - 2)
+
+    for i, t0, tk in zip(range(1, n - 1), theta0, torsion_k):
         central = particles[i]
         outer_1 = particles[i + 1]
         outer_2 = particles[i - 1]
 
+            
         c_constraint, o1_constraint, o2_constraint = make_torsion_spring_constraint(
-            central, outer_1, outer_2, theta0, torsion_k, epsilon=epsilon
+            central, outer_1, outer_2, t0, tk, epsilon=epsilon
         )
 
         central.constraints.append(c_constraint)

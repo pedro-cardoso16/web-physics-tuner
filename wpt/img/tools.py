@@ -20,6 +20,7 @@ from itertools import product
 from collections.abc import Mapping
 from scipy.spatial.distance import cdist
 from scipy.optimize import linear_sum_assignment
+from pathlib import Path
 
 os.environ["QT_LOGGING_RULES"] = "*.warning=false"
 os.environ["QT_QPA_PLATFORM"] = "xcb"
@@ -82,7 +83,7 @@ def preprocess_and_skeletonize(img, thresh=None):
                 binary_cleaned[labels == label] = 255
         else:
             # Fallback: keep the largest component
-            largest_label = 1 + np.argmax(stats[1:, cv.CC_STAT_AREA])
+            largest_label = 1 + np.argmax(stats[1:, cv.CC_STAT_AREA]) # type: ignore
             binary_cleaned = np.where(labels == largest_label, 255, 0).astype(np.uint8)
     else:
         binary_cleaned = img_binary_cleaned
@@ -341,14 +342,14 @@ def extract_info_from_image(
 
 
 def extract_nodes_from_video(
-    vid: cv.VideoCapture | str,
+    vid: cv.VideoCapture | str | Path,
     n_nodes: int = 20,
     max_workers: int | None = None,
-    save_to_file: str | None = None,
+    save_to_file: str | Path | None = None,
     thresh: int | None = None,
     anchor_pt: np.ndarray | None = None,
 ) -> dict[str, dict[str, int] | list[dict[str, list[list[int | float]] | float | int]]]:
-    if isinstance(vid, str):
+    if isinstance(vid, (str, Path)):
         vid = cv.VideoCapture(vid)
 
     total_frames = int(vid.get(cv.CAP_PROP_FRAME_COUNT))
@@ -465,7 +466,7 @@ def visualize_nodes_in_video(fp: str, original_video: str | None = None):
 
 
 if __name__ == "__main__":
-    vid = cv.VideoCapture("media/vids/vid.mp4")
+    vid = cv.VideoCapture("media/videos/demo.mp4")
     # ret, frame = vid.read()
     # frame = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
     # cv.imshow("bw_frame", frame)

@@ -207,8 +207,8 @@ class Simulation:
                         continue
                     try:
                         c_idx = self.particles.index(ref.central_particle)  # type: ignore
-                        o1_idx = self.particles.index(ref.outer_particle_1) # type: ignore
-                        o2_idx = self.particles.index(ref.outer_particle_2) # type: ignore
+                        o1_idx = self.particles.index(ref.outer_particle_1)  # type: ignore
+                        o2_idx = self.particles.index(ref.outer_particle_2)  # type: ignore
                     except ValueError:
                         continue
                     seen_torsion_refs.add(id(ref))
@@ -227,7 +227,7 @@ class Simulation:
                     and hasattr(ref, "dt")
                 ):
                     try:
-                        pivot_idx = self.particles.index(ref.pivot_particle) # type: ignore
+                        pivot_idx = self.particles.index(ref.pivot_particle)  # type: ignore
                     except ValueError:
                         continue
                     r_owner.append(idx)
@@ -243,7 +243,7 @@ class Simulation:
                     and hasattr(ref, "dt")
                 ):
                     try:
-                        pivot_idx = self.particles.index(ref.pivot_particle) # type: ignore
+                        pivot_idx = self.particles.index(ref.pivot_particle)  # type: ignore
                     except ValueError:
                         continue
                     rope_owner.append(idx)
@@ -393,7 +393,7 @@ class Simulation:
 
             # 3. Vectorized Stormer-Verlet integration (reuses `stromer`)
             next_pos = stromer(self.pos, self.prev_pos, self.acc, self.dt, self.dtp)
-            self.dtp = self.dt # save previous time step
+            self.dtp = self.dt  # save previous time step
             self.prev_pos = self.pos.copy()
             self.pos = next_pos
 
@@ -708,8 +708,11 @@ def torsion_spring_force(
     len1_safe = np.where(len1 < epsilon, 1.0, len1)
     len2_safe = np.where(len2 < epsilon, 1.0, len2)
 
-    v1_normalized = v1 / len1_safe
-    v2_normalized = v2 / len2_safe
+    # v1_normalized = v1 / len1_safe
+    # v2_normalized = v2 / len2_safe
+
+    v1_normalized = np.divide(v1, len1_safe, out=np.zeros_like(v1), where=len1_safe != 0)
+    v2_normalized = np.divide(v2, len2_safe, out=np.zeros_like(v2), where=len2_safe != 0)
 
     # 1. Dot and 2D "cross" (z-component only) products, per row
     dot_product = np.sum(v1_normalized * v2_normalized, axis=1, keepdims=True)
@@ -751,6 +754,17 @@ def torsion_spring_force(
     central_force = np.where(degenerate, 0.0, central_force)
     outer_force_1 = np.where(degenerate, 0.0, outer_force_1)
     outer_force_2 = np.where(degenerate, 0.0, outer_force_2)
+
+    # # Fallback in case of NaN values
+    # central_force = np.where(
+    #     np.isnan(central_force) | np.isinf(central_force), 0.0, central_force
+    # )
+    # outer_force_1 = np.where(
+    #     np.isnan(outer_force_1) | np.isinf(outer_force_1), 0.0, outer_force_1
+    # )
+    # outer_force_2 = np.where(
+    #     np.isnan(outer_force_2) | np.isinf(outer_force_2), 0.0, outer_force_2
+    # )
 
     if single_joint:
         return central_force[0], outer_force_1[0], outer_force_2[0]

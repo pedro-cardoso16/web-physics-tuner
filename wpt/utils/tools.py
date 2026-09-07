@@ -2,9 +2,7 @@ import numpy as np
 import pandas as pd
 import json
 import os
-from src.engine.physics import Particle
-from numpy.typing import ArrayLike
-from src.engine.physics import Simulation, Particle
+from wpt.engine.physics import Particle, Simulation
 
 
 def rotate_particles(*args: Particle, pivot: np.ndarray, angle_rad: float) -> None:
@@ -24,9 +22,8 @@ def rotate_particles(*args: Particle, pivot: np.ndarray, angle_rad: float) -> No
 
 def normalize_data_for_neural_net(file: str, output_file: str, **kwargs):
     default_kwargs = {
-        "dt_min": 0.001,
-        "dt_max": 0.01,
-        "n_nodes_max": 103,
+        "dt_max": 0.001,
+        "n_nodes_max": 23,
         "n_nodes_min": 3,
     }
     kwargs = default_kwargs | kwargs
@@ -45,13 +42,14 @@ def normalize_data_for_neural_net(file: str, output_file: str, **kwargs):
     x_min, y_min = coords.min(axis=0)
     x_max, y_max = coords.max(axis=0)
 
-    x_range, y_range = x_max - x_min, y_max - y_min
+    total_range = max(x_max, y_max) - min(x_min, y_min)
+    # x_range, y_range = x_max - x_min, y_max - y_min
 
-    coords = (coords - (x_min, y_min)) / (x_range, y_range)
+    coords = (coords - min(x_min, y_min)) / total_range
 
     velocities = np.array([frame["velocity"] for frame in data["frames"]])
     velocities = velocities.reshape((-1, 2))
-    velocities /= (x_range, y_range)
+    velocities /= total_range
 
     velocities = velocities.reshape((-1, n_nodes, 2))
     coords = coords.reshape((-1, n_nodes, 2))
@@ -61,14 +59,12 @@ def normalize_data_for_neural_net(file: str, output_file: str, **kwargs):
         frame_data["velocity"] = velocities[i].tolist()
 
         frame_data["dt"] = frame_data["dt"] / dt_max
-        # frame_data["dt"] = (frame_data["dt"] - kwargs["dt_min"]) / (
-        #     kwargs["dt_max"] - kwargs["dt_min"]
-        # )
 
     output_data["n_nodes"] = n_nodes
     output_data["n_nodes_normalized"] = (n_nodes - kwargs["n_nodes_min"]) / (
         kwargs["n_nodes_max"] - kwargs["n_nodes_min"]
     )
+    # Note: k values are max-normalized by dividing by 100 in the dataset generation
     output_data["original_range"] = {
         "x_min": x_min,
         "x_max": x_max,
@@ -94,19 +90,22 @@ def show_trajectory(
     new_resolution,
     xy_min,
     xy_max,
-    **kwargs
+    **kwargs,
 ):
-    from src.engine.game import run_engine_with_multiple_predefined_chain_paths
+    from engine.game import run_engine_with_multiple_predefined_chain_paths
 
+    # Denormalize using the consistent scalar range logic
     normalized_data = denormalize_data(
         data, original_resolution, new_resolution, xy_max, xy_min
     )
+
+    # We use the same denormalization for both to ensure they share the same coordinate space
     normalized_ground_truth_data = denormalize_data(
-        data, original_resolution, new_resolution, xy_max, xy_min
+        ground_truth_data, original_resolution, new_resolution, xy_max, xy_min
     )
 
     run_engine_with_multiple_predefined_chain_paths(
-        [data, ground_truth_data], dts, **kwargs
+        [normalized_data, normalized_ground_truth_data], dts, **kwargs
     )
 
 
@@ -146,6 +145,7 @@ def get_metadata_from_file(file_path) -> dict:
         "height": original_height,
         "dt_max": dt_max,
         "dts": dts,
+        "n_iterations": len(data["frames"]),
     }
 
 
@@ -153,7 +153,7 @@ def show_chain_trajectory(file_path: str | Path):
     from wpt.nn.model import VideoDataset
 
     # from physics import Simulation
-    from src.engine.game import (
+    from engine.game import (
         run_engine,
         draw_connections,
         run_engine_with_predefined_chain_path,
@@ -181,7 +181,9 @@ def show_chain_trajectory(file_path: str | Path):
     for frame_data in data["frames"]:
         dts.append(frame_data["dt"] * dt_max)
 
-        c = np.array(frame_data["nodes"]) * (xy_range) + xy_min
+        total_range = np.max([x_max, y_max]) - np.min([x_min, y_min])
+        offset = np.min([x_min, y_min])
+        c = np.array(frame_data["nodes"]) * total_range + offset
 
         coords.append(
             zoom_transform(
@@ -196,18 +198,21 @@ from collections.abc import Iterable
 
 
 def denormalize_data(
-    data: Iterable, original_resolution, new_resolution, xy_max, xy_min
+    data: Iterable,
+    original_resolution,
+    new_resolution,
+    xy_max: np.ndarray,
+    xy_min: np.ndarray,
 ):
-    from src.engine.game import zoom_transform
+    from wpt.engine.game import zoom_transform
 
-    xy_range = np.array(xy_max) - np.array(xy_min)
-
-    total_range = xy_range.max()
+    total_range = np.max(xy_max) - np.min(xy_min)
+    offset = np.min(xy_min)
 
     coords = []
 
     for x in data:
-        c = (np.array(x) * total_range) + xy_min
+        c = (np.array(x) * total_range) + offset
 
         coords.append(
             zoom_transform(
@@ -215,7 +220,7 @@ def denormalize_data(
                 zoom_factor=min(
                     new_resolution[0] / original_resolution[0],
                     new_resolution[1] / original_resolution[1],
-                )
+                ),
             )
         )
 
@@ -232,7 +237,7 @@ def simulate_chain_from_file(
 ) -> np.ndarray:
     data = pd.read_json(file_path)
 
-    from src.engine.physics import (
+    from wpt.engine.physics import (
         Particle,
         make_dampening_constraint,
         make_elastic_constraint,
@@ -243,45 +248,54 @@ def simulate_chain_from_file(
     if simulation is None:
         # Make by hand, it's just easier.
         particles = []
-
-        simulation = Simulation()
+        # first_dt = tuple(dts)[0] if dts is not None else 0.001
 
         # Create th particles first.
         for i in range(len(data)):
             node_data = data.iloc[i, :]
             particle = Particle(1.0, node_data["x0"], node_data["v0"])
+
+            # particle.xp = particle.x - particle.v * first_dt
             particles.append(particle)
 
         for i in range(len(data)):
             node_data = data.iloc[i, :]
             particle = particles[i]
 
+            if i == 0:
+                continue
+
             particle_above = particles[i - 1] if 0 <= (i - 1) < len(particles) else None
             particle_below = particles[i + 1] if 0 <= (i + 1) < len(particles) else None
 
             # Dampening
             particle.constraints.append(
-                make_dampening_constraint(particle, node_data["dampening_k"])
+                make_dampening_constraint(particle, node_data["dampening_k"] * 10) 
             )
 
             # Elastic
 
             if particle_above:
+                node_data_prev = data.iloc[i - 1, :]
                 particle.constraints.append(
                     make_elastic_constraint(
                         particle,
                         particle_above,
-                        node_data["elastic_k_1"],
-                        node_data["elastic_dr_1"],
+                        (node_data["elastic_k_1"] + node_data_prev["elastic_k_2"]) * 100 / 2,
+                        (node_data["elastic_dr_1"] + node_data_prev["elastic_dr_2"]) * 0.1 / 2,
                     )
                 )
+
             if particle_below:
+                node_data_next = data.iloc[i + 1, :]
                 particle.constraints.append(
                     make_elastic_constraint(
                         particle,
                         particle_below,
-                        node_data["elastic_k_2"],
-                        node_data["elastic_dr_2"],
+                        # 100,
+                        # 0.1,
+                        (node_data["elastic_k_2"] + node_data_next["elastic_k_1"]) * 100 / 2,
+                        (node_data["elastic_dr_2"] + node_data_next["elastic_dr_1"]) * 0.1 / 2,
                     )
                 )
 
@@ -292,16 +306,18 @@ def simulate_chain_from_file(
                     particle_below,
                     particle_above,
                     node_data["torsion_theta0_central"],
-                    node_data["torsion_k_central"],
+                    node_data["torsion_k_central"] / 1000,
                 )
 
                 particle.constraints.append(torsion_constraints[0])
                 particle_below.constraints.append(torsion_constraints[1])
-                particle_above.constraints.append(torsion_constraints[2])
+
+                if i != 1:
+                    particle_above.constraints.append(torsion_constraints[2])
 
             # Gravity
             particle.constraints.append(
-                make_gravitational_constraint(particle, np.array((0,node_data["g"])))
+                make_gravitational_constraint(particle, np.array((0, node_data["g"])))
             )
 
         simulation = Simulation(particles)
@@ -314,14 +330,32 @@ def simulate_chain_from_file(
             simulation.particles[i].v[:] = node_data["v0"]
             simulation.particles[i].vp[:] = node_data["v0"]
 
-    simulation.build_vectorized_constraints()
-    data = []   
+    data = []
     data.append([p.x.tolist() for p in simulation.particles])
 
-    for i in range(n_turns):
+    from tqdm import tqdm
+
+    simulation.build_vectorized_constraints()
+
+    for i in tqdm(range(n_turns), desc="Simulating chain", unit="turn"):
         if dts is not None:
             simulation.dt = tuple(dts)[i]
+
+        # ------------------ Test
+
+        # if i == 0:
+        # print(
+        #     f"Initial velocities: {[np.round(p.v, 3).tolist() for p in simulation.particles[:]]}"
+        # )
+        # ------------------
+
         simulation.run(n=1)
+
+        # ------------------ Test
+        # if i == 0:
+        # print(f"Velocities after 1st turn: {[p.v for p in simulation.particles[:]]}")
+        # ------------------
+
         data.append([p.x.tolist() for p in simulation.particles])
 
     if output_file:
@@ -337,26 +371,32 @@ if __name__ == "__main__":
 
     # show_chain_trajectory("output_normalized.json")
     gt_metadata = get_metadata_from_file("output_normalized.json")
-    data = simulate_chain_from_file("coarse_retrieval_test.json", n_turns=int(1e6), dts=[0.001] * int(1e6))
+    data = simulate_chain_from_file(
+        "coarse_retrieval_test.json", n_turns=int(1e6), dts=[0.001] * int(1e6)
+    )
 
+    # Calculate simulation's own ranges to avoid coordinate mirroring/shifting
+    coords_np = np.array(data)
+    sim_min = coords_np.min(axis=0)
+    sim_max = coords_np.max(axis=0)
 
     ground_truth_coords = denormalize_data(
         gt_metadata["coords"],
         (gt_metadata["width"], gt_metadata["height"]),
         (800, 500),
-        gt_metadata["xy_max"],
-        gt_metadata["xy_min"],
+        sim_max,
+        sim_min,
     )
 
     data = denormalize_data(
         data,
         (gt_metadata["width"], gt_metadata["height"]),
         (800, 500),
-        gt_metadata["xy_max"],
-        gt_metadata["xy_min"],
+        sim_max,
+        sim_min,
     )
 
-    from src.engine.game import run_engine_with_multiple_predefined_chain_paths
+    from wpt.engine.game import run_engine_with_multiple_predefined_chain_paths
 
     run_engine_with_multiple_predefined_chain_paths(
         [data, ground_truth_coords], dts=[1] * len(data), loop=True, framerate=600

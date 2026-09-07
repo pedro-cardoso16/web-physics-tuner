@@ -3,15 +3,21 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import pandas as pd
-from wpt.nn.model import MLP, TrainDataset, VideoDataset, HP_KEYS, pick_shard_with_all_forces
-from src.engine.physics import (
+from wpt.nn.model import (
+    MLP,
+    TrainDataset,
+    VideoDataset,
+    HP_KEYS,
+    pick_shard_with_all_forces,
+)
+from wpt.engine.physics import (
     Simulation,
     Particle,
     make_gravitational_constraint,
     make_elastic_constraint,
     make_torsion_spring_constraint,
 )
-from src.engine.presets import create_string
+from wpt.engine.presets import create_string
 
 from concurrent.futures import ProcessPoolExecutor
 
@@ -28,7 +34,7 @@ def get_active_keys_for_node(i: int, n_nodes: int) -> list[str]:
         )  # Pivot/anchor node is completely static and has no active constraints
 
     # All moving nodes experience gravity, dampening, and their parent spring connection
-    active = ["g", "dampening_k", "elastic_k_1", "elastic_dr_1"]
+    active = ["m", "g", "dampening_k", "elastic_k_1", "elastic_dr_1"]
 
     # If not the tip node, it experiences a child spring connection
     if i < n_nodes - 1:
@@ -69,7 +75,7 @@ from typing import Literal
 
 def optimize_parallel_machines(
     data: Path | dict,
-    model: Path = Path("pinn_model.pt"),
+    model: str | Path,
     device: Literal["cpu", "cuda"] = "cpu",
     lr: float = 1e-3,
     lambda_consensus: float = 10.0,
@@ -90,10 +96,12 @@ def optimize_parallel_machines(
     x_all = []
     y_all = []
 
+    model = Path(model)
+
     for i in range(n):
         m = MLP().to(device)  # machine
         if model.exists():
-            m.load("pinn_model.pt")
+            m.load(model)
 
         machines.append(m)
 
@@ -124,8 +132,13 @@ def optimize_parallel_machines(
 
     optimizer = torch.optim.Adam(params_to_optimize, lr=lr)
 
+    from tqdm import tqdm
+
+    postfix = "Total Joint Loss: {loss:.6f}, Local Fit Loss: {total_local_loss:.6f}"
+    progress = tqdm(range(n_steps), desc="Hyperparameters tuning", unit="step")
+
     # 4. Joint Optimization Loop
-    for step in range(n_steps):
+    for _ in progress:
         optimizer.zero_grad()
 
         # Compute local fitting and boundary penalties
@@ -136,6 +149,7 @@ def optimize_parallel_machines(
             mse_loss = nn.functional.mse_loss(pred, y_all[i])
             # Penalty of negative hyper-parameters.
             neg_penalty = machines[i].get_hyperparameter_penalty()
+            # non_normalization_penalty = machines[i].get_hyperparameter_penalty()
 
             local_losses.append(mse_loss)
             neg_penalties.append(neg_penalty)
@@ -230,10 +244,9 @@ def optimize_parallel_machines(
         loss.backward()
         optimizer.step()
 
-        if step % 100 == 0 or step == n_steps - 1:
-            print(
-                f"Step {step:04d}/{n_steps} | Total Joint Loss: {loss.item():.6f} | Local Fit Loss: {total_local_loss.item():.6f}"
-            )
+        progress.postfix = postfix.format(
+            loss=loss.item(), total_local_loss=total_local_loss.item()
+        )
 
     # region Generate and print individual summary tables for each node
 
@@ -287,24 +300,22 @@ def optimize_parallel_machines(
 
         data_to_save.append({k: v for k, v in zip(HP_KEYS, p_rec)})
 
-
         for idx in range(len(data_to_save)):
-            data_to_save[idx]['x0'] = x_all[idx][0][:2].tolist()
-            data_to_save[idx]['v0'] = x_all[idx][0][3:5].tolist()
-
+            data_to_save[idx]["x0"] = x_all[idx][0][:2].tolist()
+            data_to_save[idx]["v0"] = x_all[idx][0][2:4].tolist()
 
         print(node_df.to_string(index=False))
 
     metadata_to_save = {}
-    metadata_to_save['x'] = [x_all[i][:,:2].tolist() for i in range(n)]
-    metadata_to_save['v'] = [x_all[i][:,3:5].tolist() for i in range(n)]
-    metadata_to_save['dt'] = [d[-1].tolist() for d in datasets[0].input_data]
+    metadata_to_save["x"] = [x_all[i][:, :2].tolist() for i in range(n)]
+    metadata_to_save["v"] = [x_all[i][:, 2:4].tolist() for i in range(n)]
+    metadata_to_save["dt"] = [d[-1].tolist() for d in datasets[0].input_data]
 
     if output_file:
         with open(output_file, "w") as f:
             json.dump(data_to_save, f, indent=2)
 
-        with open(output_file.removesuffix('.json') + "_metadata.json", "w") as f:
+        with open(output_file.removesuffix(".json") + "_metadata.json", "w") as f:
             json.dump(metadata_to_save, f, indent=2)
 
     # endregion
@@ -587,21 +598,19 @@ def optimize_parallel_system(
 
 
 class Optimizer:
-    def __init__(self, data: dict, model: Path | str) -> None:
+    def __init__(self, model: Path | str, data: dict = {}) -> None:
         self.data = data
         self.simulations = []
         self.model = Path(model)
         pass
 
-    def coarse_optimize(self, **kwargs):
+    def coarse_optimize(self, normalized_video_data: str | Path, **kwargs):
         """Coarse Optimize
 
         Optimization using MLP parallel execution. This represents the first
         optimization step
 
         Args:
-            model (Path | str): Path to the trained model.
-
             device (str): PyTorch device. Defaults to `"cpu"`.
 
             lr (float): Learning rate. Defaults to `0.001`.
@@ -612,11 +621,11 @@ class Optimizer:
 
         from wpt.nn.model import VideoDataset
 
-        shared_data = VideoDataset.load_data("output_normalized.json")
+        shared_data = VideoDataset.load_data(normalized_video_data)
 
         # Create the instances of dataset for each node in the data.
 
-        optimize_parallel_machines(shared_data, **kwargs)
+        optimize_parallel_machines(shared_data, model=self.model, **kwargs)
 
     def fine_optimize(self, hyper_parameters: dict | None = None, n_frames: int = 10):
 
@@ -628,7 +637,6 @@ class Optimizer:
         for i in range(0, len(self.data["frames"]), n_frames - 1):
             simulation = Simulation()
             particles = create_string(
-                simulation,
                 [0, 0],
                 n_nodes,
                 1,
@@ -647,11 +655,14 @@ class Optimizer:
         with ProcessPoolExecutor() as executor:
             pass
 
-    def optimize(self):
-        self.coarse_optimize()
-        self.fine_optimize()
+    # def optimize(self):
+    #     self.coarse_optimize()
+    #     self.fine_optimize()
+
 
 from typing import Any
+
+
 def fit_hyper_parameters(
     start_coords: torch.Tensor | Any,
     start_velocities: torch.Tensor | Any,
@@ -719,19 +730,11 @@ def fit_hyper_parameters(
     #     target = simulation.particles.x
     #     loss += mse_loss(input=,target=target)
 
-
     # loss.backward()
     # optim.step()
     # optim.zero_grad()
 
-
-
-
     # --- Grad calculation ---
-
-
-
-
 
 
 if __name__ == "__main__":

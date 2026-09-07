@@ -1,5 +1,5 @@
 import pygame as pg
-from physics import *
+from .physics import *
 from typing import Literal, Iterable
 
 PARTICLE_RADIUS = 3
@@ -206,6 +206,13 @@ pg.display.set_caption("Particle Connections")
 clock = pg.time.Clock()
 
 if __name__ == "__main__":
+
+    # Setup Screen Configuration
+    WIDTH, HEIGHT = 800, 500
+    screen = pg.display.set_mode((WIDTH, HEIGHT))
+    pg.display.set_caption("Particle Connections")
+    clock = pg.time.Clock()
+    
     # Create the particles:
     center = (WIDTH / 2, HEIGHT / 2)
     particle1 = Particle(

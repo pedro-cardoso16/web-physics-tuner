@@ -9,8 +9,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from typing import Literal
+
 HP_KEYS = (
-    # "m",
+    "m",
     "g",
     "dampening_k",
     "elastic_k_1",
@@ -325,7 +326,7 @@ class MappedRopeDataset(IterableDataset):
 
     def __init__(
         self,
-        pt_dir: str,
+        pt_dir: str | Path,
         mode: str = "window",
         window_fraction: float = 0.2,
         shuffle: bool = True,
@@ -347,7 +348,7 @@ class MappedRopeDataset(IterableDataset):
             pt_path / "data.bin", dtype="float32", mode="r", shape=(N, 7)
         )
         self.hp_mmap = np.memmap(
-            pt_path / "hp.bin", dtype="float32", mode="r", shape=(N, 12)
+            pt_path / "hp.bin", dtype="float32", mode="r", shape=(N, len(HP_KEYS))
         )
         self.label_mmap = np.memmap(
             pt_path / "label.bin", dtype="float32", mode="r", shape=(N, 2)
@@ -646,12 +647,18 @@ class MLP(nn.Module):
         self.eval()
 
     def get_hyperparameter_penalty(self, multiplier: float = 1.0) -> torch.Tensor:
-        """Computes a soft L2 penalty for any negative hyperparameters."""
+        """Computes a soft L2 penalty for any negative hyperparameters.
+        Also adds penalty for out of bonds normalization, that is values greater than 1.
+        """
         device = next(self.parameters()).device
         penalty = torch.tensor(0.0, device=device)
 
-        for p in self.hyper_params.values():
+        for k, p in self.hyper_params.items():
             penalty += torch.sum(torch.relu(-p) ** 2)
+            penalty += torch.sum(torch.relu(p - 1) ** 2)
+
+            if k == "m":
+                penalty += torch.sum(torch.relu(0.1 - p) ** 2)
 
         penalty *= multiplier
 
@@ -733,6 +740,142 @@ class MLP(nn.Module):
         # Freeze network parameters and exclude non-optimized variables from backpropagation
         exclude_keys = [k for k in HP_KEYS if k not in optimize_keys]
         self.freeze_network(exclude_hps=exclude_keys)
+
+
+def train_model(shard_dir: str | Path, model_path: str | Path, **kwargs) -> MLP:
+    """
+
+    Args:
+        shard_dir (str | Path): Path to shard directory
+
+        model_path (str | Path): Path to the pytorch model file `<file_name>.pt`
+
+        kwargs (Any):
+            - overwrite (bool): Wheter to overwrite existing model. Defaults to `False`.
+            - device (str | None): Device to use `"cpu"` or `"cuda"`, when `None`, it auto-detects if
+                cuda is available and fallsback to `"cpu"` if not available. Defaults to `None`
+            - batch_size (int): Size of the batch. Defaults to `524288`
+            - n_epochs (int): Total number of epochs. Defaults to `1`.
+            - load_to_ram (bool): Wheter or not to load the entire synthetic dataset into memory
+                **Warning** only set to `True` if you have enough ram available. Defaults to `False`
+            - window_fraction (float): Fraction of dataset to use with the window. Avoids memory overflow.
+                Defaults to `0.15`.
+                - n_workers (int): Total number of pool processing workers. Defaults to `4`.
+    """
+    from torch.utils.data import DataLoader
+    from tqdm import tqdm
+
+    shard_dir = Path(shard_dir)
+    model_path = Path(model_path)
+
+    try:
+        with open(shard_dir / "manifest.json") as f:
+            manifest = json.load(f)
+
+    except FileNotFoundError:
+
+        raise FileNotFoundError(
+            f"Could not find manifest.json in '{shard_dir}'. "
+            "Please run 'python dataset_generator.py' to generate shards before running model.py."
+        )
+
+    if not manifest:
+        raise ValueError(
+            "The manifest.json file is empty. Please run dataset_generator.py to generate shards."
+        )
+
+    # Detect system hardware (Activate CUDA/GPU support if available)
+    device = kwargs.get("device", None)
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"Active Hardware Device: {device}")
+
+    # Move model to selected device
+    model = MLP().to(device)
+
+    # Check for existing trained model
+    if model_path.exists() and not kwargs.get("overwrite", False):
+        print(
+            f"Model already exists. Skipping training. Loading from '{model_path}'..."
+        )
+
+        model.load(model_path)
+        model = model.to(device)
+
+        return model
+
+    print("Starting model training...")
+
+    # Directory with the shards of the pytorch model parameters values tensor.
+    pt_dir = Path(shard_dir.parent / "pt_shards")
+
+    BATCH_SIZE = kwargs.get("batch_size", int(2**19))
+
+    # Caches your pre-compiled binary dataset into your 32 GB RAM [1]
+    train_dataset = MappedRopeDataset(
+        pt_dir, window_fraction=kwargs.get("window_fraction", 0.15), load_to_ram=kwargs.get("load_to_ram", False), shuffle=True  # type: ignore
+    )
+
+    total_batches = (train_dataset.N + BATCH_SIZE - 1) // BATCH_SIZE
+
+    # Added pin_memory=True for fast, asynchronous GPU (PCIe) transfers! [1.1.2]
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        num_workers=kwargs.get("num_workers", 4),
+        pin_memory=True,
+        persistent_workers=True,
+    )
+
+    # The hyperparams are known for this training step.
+    model.freeze_hyperparams()
+
+    optimizer = torch.optim.Adam(
+        [p for p in model.parameters() if p.requires_grad], lr=kwargs.get("lr", 1e-2)
+    )
+
+    n_epochs = kwargs.get("n_epochs", 1)
+
+    epoch_bar = tqdm(range(n_epochs), desc="Training", unit="epoch")
+
+    for epoch in epoch_bar:
+        total_loss, n_batches = 0.0, 0
+
+        batch_bar = tqdm(
+            train_loader, desc=f"Epoch {epoch+1}", unit="batch", total=total_batches
+        )
+
+        for x_batch, hp_batch, y_batch in batch_bar:
+            # non_blocking=True overlaps the PCIe memory transfer with GPU computing
+            x_batch = x_batch.to(device, non_blocking=True)
+            hp_batch = hp_batch.to(device, non_blocking=True)
+            y_batch = y_batch.to(device, non_blocking=True)
+
+            pred = model(x_batch, hp=hp_batch)
+            loss = nn.functional.mse_loss(pred, y_batch)
+
+            optimizer.zero_grad()
+
+            loss.backward()
+
+            optimizer.step()
+
+            total_loss += loss.item()
+            n_batches += 1
+
+            batch_bar.set_postfix(loss=f"{loss.item():.8f}")
+
+        avg_loss = total_loss / n_batches
+
+        epoch_bar.set_postfix(avg_loss=f"{avg_loss:.8f}")
+
+    # Save model after completing training
+    print(f"Saving trained model to '{model_path}'...")
+    model.save(model_path)
+
+    return model
 
 
 if __name__ == "__main__":

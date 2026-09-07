@@ -41,4 +41,4 @@ def compile_shards_incrementally(json_dir: str, pt_dir: str):
     print(f"Successfully compiled all shards into {pt_dir}!")
 
 if __name__ == "__main__":
-    compile_shards_incrementally("data/shards", "data/pt_shards")
+    compile_shards_incrementally("tmp/data/shards", "tmp/data/pt_shards")
