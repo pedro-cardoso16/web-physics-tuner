@@ -424,8 +424,9 @@ def elastic_force(
     d_min: float | np.ndarray = 1e-16,
     d_max: float | np.ndarray = np.finfo("float").max / 1000,
     max_force: float = 1e6,  # tune to whatever scale is physically sensible for your sim
+    k_damp: None| float = None,
+    v: None| np.ndarray = None,
 ) -> np.ndarray:
-
     dx = x2 - x1
     d = np.linalg.norm(dx, axis=-1, keepdims=True)
 
@@ -438,6 +439,14 @@ def elastic_force(
     mag = np.clip(mag, -max_force, max_force)  # the actual overflow guard
 
     f = dxu * mag  # force
+
+    # Elastic dampening effect
+    if v is not None and k_damp is not None:
+        if k_damp < 0:
+            raise ValueError("k_damp must be a non-negative value.")
+    
+        v_proj = v.dot(dxu) * dxu # projection along the connection line
+        f += -k_damp * v_proj 
 
     return f
 
