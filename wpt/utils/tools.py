@@ -70,6 +70,7 @@ def normalize_data_for_neural_net(file: str, output_file: str, **kwargs):
         "x_max": x_max,
         "y_min": y_min,
         "y_max": y_max,
+        "total_range": max(x_max, y_max) - min(x_min, y_min),
     }
 
     output_data["dt_max"] = dt_max
@@ -115,7 +116,7 @@ def get_metadata_from_file(file_path) -> dict:
     data = VideoDataset.load_data(file_path)
     dts = []
 
-    x_min, x_max, y_min, y_max = data["original_range"].values()
+    x_min, x_max, y_min, y_max, total_range = data["original_range"].values()
 
     x_range = x_max - x_min
     y_range = y_max - y_min
@@ -141,6 +142,7 @@ def get_metadata_from_file(file_path) -> dict:
         "xy_range": xy_range,
         "xy_min": xy_min,
         "xy_max": xy_max,
+        "total_range": total_range,
         "width": original_width,
         "height": original_height,
         "dt_max": dt_max,
@@ -234,6 +236,7 @@ def simulate_chain_from_file(
     simulation: None | Simulation = None,
     output_file: None | Path | str = None,
     dts: None | Iterable[float] = None,
+    metadata: dict = {},
 ) -> np.ndarray:
     data = pd.read_json(file_path)
 
@@ -245,6 +248,9 @@ def simulate_chain_from_file(
         make_gravitational_constraint,
     )
 
+    x_min = min(metadata['xy_min']) 
+    x_range = metadata["total_range"]
+
     if simulation is None:
         # Make by hand, it's just easier.
         particles = []
@@ -253,10 +259,14 @@ def simulate_chain_from_file(
         # Create th particles first.
         for i in range(len(data)):
             node_data = data.iloc[i, :]
-            particle = Particle(1.0, node_data["x0"], node_data["v0"])
+            mass = node_data["m"] * metadata["m_max"] if i != 0 else 1.0
+            particle = Particle(mass, np.array(node_data["x0"]) * x_range + x_min  , np.array(node_data["v0"]) * x_range)
 
+            print(particle.m)
             # particle.xp = particle.x - particle.v * first_dt
             particles.append(particle)
+
+        global_g = data["g"].mean()
 
         for i in range(len(data)):
             node_data = data.iloc[i, :]
@@ -270,19 +280,34 @@ def simulate_chain_from_file(
 
             # Dampening
             particle.constraints.append(
-                make_dampening_constraint(particle, node_data["dampening_k"] * 10) 
+                make_dampening_constraint(
+                    particle, node_data["dampening_k"] * metadata["dampening_k_max"]*0.001 
+                )
             )
 
             # Elastic
 
             if particle_above:
                 node_data_prev = data.iloc[i - 1, :]
+
+                k_value = (
+                    np.mean((node_data["elastic_k_1"], node_data_prev["elastic_k_2"]))
+                    if i != 1
+                    else node_data["elastic_k_1"]
+                )
+
+                dr_value = (
+                    np.mean((node_data["elastic_dr_1"], node_data_prev["elastic_dr_2"]))
+                    if i != 1
+                    else node_data["elastic_dr_1"]
+                )
+
                 particle.constraints.append(
                     make_elastic_constraint(
                         particle,
                         particle_above,
-                        (node_data["elastic_k_1"] + node_data_prev["elastic_k_2"]) * 100 / 2,
-                        (node_data["elastic_dr_1"] + node_data_prev["elastic_dr_2"]) * 0.1 / 2,
+                        k_value * metadata["k_max"],
+                        dr_value * metadata["total_range"],
                     )
                 )
 
@@ -294,19 +319,27 @@ def simulate_chain_from_file(
                         particle_below,
                         # 100,
                         # 0.1,
-                        (node_data["elastic_k_2"] + node_data_next["elastic_k_1"]) * 100 / 2,
-                        (node_data["elastic_dr_2"] + node_data_next["elastic_dr_1"]) * 0.1 / 2,
+                        np.mean(
+                            (node_data["elastic_k_2"], node_data_next["elastic_k_1"])
+                        )
+                        * metadata["k_max"]
+                        ,
+                        np.mean(
+                            (node_data["elastic_dr_2"], node_data_next["elastic_dr_1"])
+                        )
+                        * metadata["total_range"]
+                        ,
                     )
                 )
 
-            # Torsion
+            # --- Torsion ---
             if particle_below and particle_above:
                 torsion_constraints = make_torsion_spring_constraint(
                     particle,
                     particle_below,
                     particle_above,
-                    node_data["torsion_theta0_central"],
-                    node_data["torsion_k_central"] / 1000,
+                    node_data["torsion_theta0_central"] * (2 * np.pi),
+                    node_data["torsion_k_central"] * metadata["torsion_k_max"],
                 )
 
                 particle.constraints.append(torsion_constraints[0])
@@ -317,7 +350,9 @@ def simulate_chain_from_file(
 
             # Gravity
             particle.constraints.append(
-                make_gravitational_constraint(particle, np.array((0, node_data["g"])))
+                make_gravitational_constraint(
+                    particle, np.array((0, global_g * metadata["g_max"] * 10))
+                )
             )
 
         simulation = Simulation(particles)
@@ -331,11 +366,14 @@ def simulate_chain_from_file(
             simulation.particles[i].vp[:] = node_data["v0"]
 
     data = []
-    data.append([p.x.tolist() for p in simulation.particles])
+    # data.append([p.x.tolist() for p in simulation.particles])
+    data.append([((p.x - x_min)/x_range).tolist() for p in simulation.particles])
+
 
     from tqdm import tqdm
 
     simulation.build_vectorized_constraints()
+
 
     for i in tqdm(range(n_turns), desc="Simulating chain", unit="turn"):
         if dts is not None:
@@ -356,7 +394,7 @@ def simulate_chain_from_file(
         # print(f"Velocities after 1st turn: {[p.v for p in simulation.particles[:]]}")
         # ------------------
 
-        data.append([p.x.tolist() for p in simulation.particles])
+        data.append([((p.x - x_min)/x_range).tolist() for p in simulation.particles])
 
     if output_file:
         os.makedirs(Path(output_file).parent, exist_ok=True)
@@ -364,6 +402,16 @@ def simulate_chain_from_file(
             json.dump(data, f)
 
     return np.array(data)
+
+def get_chain_length(*args):
+    total_length = 0
+
+    x = np.array(args)
+
+    for i in range(len(x)-1):
+        total_length += np.linalg.norm(x[i+1] - x[i])
+
+    return total_length
 
 
 if __name__ == "__main__":

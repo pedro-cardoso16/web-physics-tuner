@@ -89,6 +89,8 @@ def execution(**kwargs):
         "n_nodes_min": 3,
         "k_max": 100,
         "k_min": 20,
+        "k_max_factor": 105,
+        "k_min_factor": 95,
         "dampening_k_max": 10,
         "dampening_k_min": 0.1,
         "g_max": 1,
@@ -100,8 +102,8 @@ def execution(**kwargs):
         "dt_max": 0.001,
         "step_max": 20,
         "step_min": 0.001,
-        "m_max": 1.0,
-        "m_min": 0.1,
+        "m_max": 10.0,
+        "m_min": 8.0,
     }
 
     default_kwargs |= kwargs
@@ -118,7 +120,8 @@ def execution(**kwargs):
     step = rng.uniform(
         default_kwargs["step_min"], default_kwargs["step_max"]
     )  # base distance between consecutive nodes
-    k = rng.uniform(default_kwargs["k_min"], default_kwargs["k_max"])
+
+
     dampening_k = rng.uniform(
         default_kwargs["dampening_k_min"], default_kwargs["dampening_k_max"]
     )
@@ -126,6 +129,9 @@ def execution(**kwargs):
     torsion_k = rng.uniform(
         default_kwargs["torsion_k_min"], default_kwargs["torsion_k_max"], n_nodes - 2
     )
+
+    k = rng.uniform(default_kwargs["k_min_factor"], default_kwargs["k_max_factor"]) * g / step
+
     angle_rad = rng.uniform(
         default_kwargs["torsion_angle_min"],
         default_kwargs["torsion_angle_max"],
@@ -144,8 +150,13 @@ def execution(**kwargs):
         dampening=dampening_k,
     )
 
-    for p in particles:
-        p.m = rng.uniform(default_kwargs["m_min"], default_kwargs["m_max"])
+
+    particles_masses = rng.uniform(default_kwargs["m_min"], default_kwargs["m_max"], n_nodes)
+
+    particles_masses /= np.sum(particles_masses)
+
+    for i, p in enumerate(particles):
+        p.m = particles_masses[i]
 
     rotate_particles(
         *particles, pivot=particles[0].x, angle_rad=rng.uniform(-np.pi / 2, np.pi / 2)
@@ -233,8 +244,9 @@ def execution(**kwargs):
                 case "gravitational_force":
                     k["g"][1] /= default_kwargs["g_max"]
 
+        d["hyperparams"]["m"] /= default_kwargs["m_max"]
+
     file_path = kwargs.get("output_file", None)
-    metadata = default_kwargs.copy()
 
     if file_path:
         file_path = Path(file_path)
@@ -277,28 +289,44 @@ def generate_dataset(
         "seed": None,
         "n_nodes_max": 23,
         "n_nodes_min": 3,
-        "k_max": 100,
-        "k_min": 20,
-        "dampening_k_max": 10,
-        "dampening_k_min": 0.1,
-        "g_max": 1,
-        "g_min": 0,
-        "torsion_k_max": 0.2,
+        "k_max": 110,
+        "k_min": 90,
+        "dampening_k_max": 0.001,
+        "dampening_k_min": 0.0001,
+        "g_max": 10,
+        "g_min": 8,
+        "torsion_k_max": 0.02,
         "torsion_k_min": 0,
         "torsion_angle_max": 1.5 * np.pi,
         "torsion_angle_min": 0.5 * np.pi,
         "dt_max": 0.001,
         "step_max": 20,
         "step_min": 0.001,
-        "m_max": 1.0,
-        "m_min": 0.1,
+        "m_max": 10.0,
+        "m_min": 8.0,
+        "dr_max": 10,
+        "dr_min": 0.001,
     }
 
-    default_kwargs |= kwargs
+    default_kwargs |= kwargs | {"seed": seed}
+
+    default_kwargs['k_max_factor'] = default_kwargs['k_max']
+    default_kwargs['k_min_factor'] = default_kwargs['k_min']
+
+    default_kwargs["k_max"] *= default_kwargs["g_max"] / default_kwargs["dr_min"]
+    default_kwargs["k_min"] *= default_kwargs["g_min"] / default_kwargs["dr_max"]
+
+    m_max = default_kwargs['m_max']
+    default_kwargs['m_max'] /= m_max
+    default_kwargs['m_min'] /= m_max
 
     shard_dir = Path(shard_dir)
 
-    if clean and input(f"Do you want to delete {shard_dir} [Y/n]").lower() in ['y', '']:
+    if clean and input(f"Do you want to delete {shard_dir} [Y/n]: ").lower() in [
+        "y",
+        "",
+    ]:
+        print("Deleting old shard directory...")
         shutil.rmtree(shard_dir)
 
     Path(shard_dir).mkdir(parents=True, exist_ok=True)
@@ -340,9 +368,7 @@ def generate_dataset(
     metadata = dict(default_kwargs)
 
     metadata_file_path = Path(shard_dir) / "metadata.json"
-    with open(
-        metadata_file_path, "w", encoding="utf-8"
-    ) as f:
+    with open(metadata_file_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f)
 
     from wpt.utils.compile_and_stack import compile_and_stack_dataset

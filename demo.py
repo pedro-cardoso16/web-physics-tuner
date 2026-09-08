@@ -1,10 +1,10 @@
 """
 Demo file for showing process pipeline end-to-end
 """
-
+from pathlib import Path
 import numpy as np
 import tensorboard
-
+import json
 # from wpt.optim.optimizer_parallel import Optimizer
 from wpt.utils.dataset_generator import generate_dataset
 from wpt.optim.optimizer_parallel import Optimizer
@@ -19,11 +19,9 @@ if __name__ == "__main__":
     # Pre pipeline
 
     # 1. Generate synthetic dataset for training
-    shard_dir = "tmp/data/shards"
-    generate_dataset(shard_dir, seed=1, n_simulations=150, n_iterations=100, n_nodes_max=10, max_workers=6)
+    shard_dir = Path("tmp/data/shards")
+    # generate_dataset(shard_dir, seed=1, n_simulations=10000, n_iterations=300, n_nodes_max=10, max_workers=6)
 
-    import sys
-    sys.exit()
     # 2. Train the model
     # train_model(shard_dir, "models/pinn.pt", n_epochs=5, window_fraction=0.15, overwrite=True)
 
@@ -57,9 +55,9 @@ if __name__ == "__main__":
 
     # optimizer.coarse_optimize(
     #     normalized_video_data="tmp/data/video_output_normalized.json",
-    #     n_steps=10000,
+    #     n_steps=5000,
     #     device="cuda",
-    #     lambda_consensus=12.0,
+    #     lambda_consensus=15.0,
     #     output_file="coarse_retrieval_test.json",
     # )
     # Visualize the trajectory
@@ -73,10 +71,15 @@ if __name__ == "__main__":
         "tmp/data/video_output_normalized.json"
     )
 
-    n_turns = normalized_ground_truth_metadata["n_iterations"] * 100
+    n_turns = normalized_ground_truth_metadata["n_iterations"]*100
+
+    total_range = normalized_ground_truth_metadata['total_range']
+
+    metadata = json.load(open(shard_dir / "metadata.json")) | {"total_range": total_range} | {"xy_min": normalized_ground_truth_metadata['xy_min']}
     data = simulate_chain_from_file(
-        "coarse_retrieval_test.json", n_turns=n_turns, dts=[0.01] * n_turns
+        "coarse_retrieval_test.json", n_turns=n_turns, dts=[0.1] * n_turns, metadata=metadata
     )
+    
 
     # Ground truth is denormalized using its own original ranges
     ground_truth_coords = denormalize_data(
@@ -109,5 +112,5 @@ if __name__ == "__main__":
     from wpt.engine.game import run_engine_with_multiple_predefined_chain_paths
 
     run_engine_with_multiple_predefined_chain_paths(
-        [data], dts=[0.001] * len(data), loop=True, framerate=60
+        [data, ground_truth_coords], dts=[0.1] * len(data), loop=True, framerate=60
     )

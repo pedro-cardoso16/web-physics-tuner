@@ -421,7 +421,7 @@ def elastic_force(
     x2: np.ndarray,
     k: float | np.ndarray,
     dr: float | np.ndarray,
-    d_min: float | np.ndarray = 0.0001,
+    d_min: float | np.ndarray = 1e-16,
     d_max: float | np.ndarray = np.finfo("float").max / 1000,
     max_force: float = 1e6,  # tune to whatever scale is physically sensible for your sim
 ) -> np.ndarray:
@@ -443,7 +443,7 @@ def elastic_force(
 
 
 def make_elastic_constraint(
-    particle1: Particle, particle2: Particle, k: float, dr: float, d_min: float = 0.0001
+    particle1: Particle, particle2: Particle, k: float, dr: float, d_min: float = 1e-16
 ) -> Constraint:
     """
     Create an elastic force constraint from two Particle instances.

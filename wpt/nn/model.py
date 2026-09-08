@@ -646,19 +646,35 @@ class MLP(nn.Module):
                 p.requires_grad_(True)
         self.eval()
 
-    def get_hyperparameter_penalty(self, multiplier: float = 1.0) -> torch.Tensor:
+    def get_hyperparameter_penalty(
+        self,
+        multiplier: float = 1.0,
+        n_nodes: int = 8,
+        l_normalized: float = 1.0,
+        base_k: float = 1.0,
+    ) -> torch.Tensor:
         """Computes a soft L2 penalty for any negative hyperparameters.
         Also adds penalty for out of bonds normalization, that is values greater than 1.
         """
         device = next(self.parameters()).device
         penalty = torch.tensor(0.0, device=device)
 
+        base_dr_value = torch.tensor(l_normalized / (n_nodes - 1))
+
         for k, p in self.hyper_params.items():
-            penalty += torch.sum(torch.relu(-p) ** 2)
-            penalty += torch.sum(torch.relu(p - 1) ** 2)
+            penalty += torch.sum(10 * torch.relu(-p) ** 2)
+            penalty += torch.sum(10 * torch.relu(p - 1) ** 2)
 
             if k == "m":
-                penalty += torch.sum(torch.relu(0.1 - p) ** 2)
+                penalty += torch.sum(0.1 * (p - (1 / n_nodes)) ** 2)
+
+            if k == "elastic_k_1" or k == "elastic_k_2":
+                distance = torch.abs(p - base_k) / base_k
+                penalty += torch.sum(torch.relu(distance - 0.001) ** 2)
+
+            if k == "elastic_dr_1" or k == "elastic_dr_2":
+                distance = torch.abs(p - base_dr_value) / base_dr_value
+                penalty += torch.sum(torch.relu(distance - 0.001) ** 2)
 
         penalty *= multiplier
 
@@ -711,6 +727,7 @@ class MLP(nn.Module):
         self,
         optimize_keys: list[str] | None = None,
         initial_val: float | dict[str, float] | torch.Tensor | list[float] = 0.5,
+        default_val: float = 0.5,
     ) -> None:
         """
         Set up coarse optimization in a single call.
@@ -726,7 +743,7 @@ class MLP(nn.Module):
                 if k in optimize_keys:
                     # Assign the correct starting value format
                     if isinstance(initial_val, dict):
-                        val = initial_val.get(k, 0.5)
+                        val = initial_val.get(k, default_val)
                     elif isinstance(initial_val, (list, tuple, torch.Tensor)):
                         val = initial_val[i]
                     else:

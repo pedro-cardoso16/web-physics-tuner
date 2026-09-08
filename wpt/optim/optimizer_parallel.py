@@ -88,7 +88,7 @@ def optimize_parallel_machines(
     if isinstance(data, Path):
         data = load_video_data(data)
 
-    n = data["n_nodes"]  # Number of machines (one per node).
+    n_nodes = data["n_nodes"]  # Number of machines (one per node).
 
     # 1. Instantiate  parallel machines and local datasets
     machines: list[MLP] = []
@@ -98,7 +98,7 @@ def optimize_parallel_machines(
 
     model = Path(model)
 
-    for i in range(n):
+    for i in range(n_nodes):
         m = MLP().to(device)  # machine
         if model.exists():
             m.load(model)
@@ -112,20 +112,39 @@ def optimize_parallel_machines(
 
     # --- Step 2 ---
     # region Apply localized parameter configurations based on node positioning
-    for i in range(n):
-        active_keys = get_active_keys_for_node(i, n)
+    initial_g = 1.0
+    dr_min = 0.001  # This is from the generated dataset
+
+    from wpt.utils.tools import get_chain_length
+
+    l_normalized = get_chain_length(*(x_all[i][0][:2].cpu() for i in range(n_nodes)))
+    l = l_normalized * data["original_range"]["total_range"]
+
+    base_k = initial_g * dr_min * (n_nodes - 1) / l
+    print(base_k)
+    for i in range(n_nodes):
+        active_keys = get_active_keys_for_node(i, n_nodes)
 
         # setup_phase2 sets true_values for frozen parameters (which are 0.0 on inactive nodes)
         # and configures gradients accordingly
         machines[i].setup_hyperparameters_tuning(
-            optimize_keys=active_keys, initial_val=0.5
+            optimize_keys=active_keys,
+            initial_val={
+                "m": 1/n_nodes,
+                "g": initial_g,
+                "elastic_k_1": base_k,
+                "elastic_k_2": base_k,
+                "elastic_dr_1": l_normalized / (n_nodes - 1),
+                "elastic_dr_2": l_normalized / (n_nodes - 1),
+            },
+            default_val=0.8,
         )
 
     # endregion
 
     # 3. Collect active parameters from all nodes for the joint optimizer
     params_to_optimize = []
-    for i in range(1, n):  # Node 0 is pivot and stays completely frozen
+    for i in range(1, n_nodes):  # Node 0 is pivot and stays completely frozen
         params_to_optimize.extend(
             [p for p in machines[i].parameters() if p.requires_grad]
         )
@@ -144,11 +163,13 @@ def optimize_parallel_machines(
         # Compute local fitting and boundary penalties
         local_losses = []
         neg_penalties = []
-        for i in range(1, n):
+        for i in range(1, n_nodes):
             pred = machines[i](x_all[i], hp=None)
             mse_loss = nn.functional.mse_loss(pred, y_all[i])
             # Penalty of negative hyper-parameters.
-            neg_penalty = machines[i].get_hyperparameter_penalty()
+            neg_penalty = machines[i].get_hyperparameter_penalty(
+                n_nodes=n_nodes, l_normalized=l_normalized, base_k=base_k
+            )
             # non_normalization_penalty = machines[i].get_hyperparameter_penalty()
 
             local_losses.append(mse_loss)
@@ -159,12 +180,12 @@ def optimize_parallel_machines(
 
         # Compute Consensus Penalties.
         # Global gravity g consensus.
-        g_vals = torch.stack([machines[i].hyper_params["g"] for i in range(1, n)])
+        g_vals = torch.stack([machines[i].hyper_params["g"] for i in range(1, n_nodes)])
         g_consensus = torch.sum((g_vals - torch.mean(g_vals)) ** 2)
 
         # Global dampening dampening_k consensus
         damp_vals = torch.stack(
-            [machines[i].hyper_params["dampening_k"] for i in range(1, n)]
+            [machines[i].hyper_params["dampening_k"] for i in range(1, n_nodes)]
         )
         damp_consensus = torch.sum((damp_vals - torch.mean(damp_vals)) ** 2)
 
@@ -172,7 +193,7 @@ def optimize_parallel_machines(
         elastic_k_diffs = []
         elastic_dr_diffs = []
 
-        for i in range(2, n):
+        for i in range(2, n_nodes):
             elastic_k_diffs.append(
                 (
                     machines[i].hyper_params["elastic_k_1"]
@@ -202,7 +223,7 @@ def optimize_parallel_machines(
         # Torsion spring consensus (coupling central joint j with arms at j+1 and j-1)
         torsion_k_penalty = torch.tensor(0.0, device=device)
         torsion_theta_penalty = torch.tensor(0.0, device=device)
-        for j in range(1, n - 1):
+        for j in range(1, n_nodes - 1):
             k_terms = [machines[j].hyper_params["torsion_k_central"]]
             theta_terms = [machines[j].hyper_params["torsion_theta0_central"]]
 
@@ -253,7 +274,7 @@ def optimize_parallel_machines(
     pd.set_option("display.float_format", lambda v: f"{v:.6f}")
 
     data_to_save = []
-    for i in range(n):
+    for i in range(n_nodes):
         print(f"\n>>> Node {i} parameter discovery:")
         if i == 0:
             print("  [Stationary Pivot Node - All parameters locked at 0.0]")
@@ -262,7 +283,7 @@ def optimize_parallel_machines(
             p_err = [0.0] * len(HP_KEYS)
             p_status = ["Static Pivot"] * len(HP_KEYS)
         else:
-            active_keys = get_active_keys_for_node(i, n)
+            active_keys = get_active_keys_for_node(i, n_nodes)
 
             # Re-apply exclusion check for descriptive logging in console printout
             if exclude_from_optimization is not None:
@@ -307,8 +328,8 @@ def optimize_parallel_machines(
         print(node_df.to_string(index=False))
 
     metadata_to_save = {}
-    metadata_to_save["x"] = [x_all[i][:, :2].tolist() for i in range(n)]
-    metadata_to_save["v"] = [x_all[i][:, 2:4].tolist() for i in range(n)]
+    metadata_to_save["x"] = [x_all[i][:, :2].tolist() for i in range(n_nodes)]
+    metadata_to_save["v"] = [x_all[i][:, 2:4].tolist() for i in range(n_nodes)]
     metadata_to_save["dt"] = [d[-1].tolist() for d in datasets[0].input_data]
 
     if output_file:
