@@ -16,8 +16,10 @@ HP_KEYS = (
     "dampening_k",
     "elastic_k_1",
     "elastic_dr_1",
+    "elastic_k_damp_1",
     "elastic_k_2",
     "elastic_dr_2",
+    "elastic_k_damp_2",
     "torsion_theta0_central",
     "torsion_k_central",
     "torsion_theta0_outer1",
@@ -42,9 +44,11 @@ def merge_hp(records: list[dict]) -> torch.Tensor:
         if "elastic_force_1" in fh:
             vals["elastic_k_1"] = fh["elastic_force_1"]["k"]
             vals["elastic_dr_1"] = fh["elastic_force_1"]["dr"]
+            vals["elastic_k_damp_1"] = fh["elastic_force_1"]["k_damp"]
         if "elastic_force_2" in fh:
             vals["elastic_k_2"] = fh["elastic_force_2"]["k"]
             vals["elastic_dr_2"] = fh["elastic_force_2"]["dr"]
+            vals["elastic_k_damp_2"] = fh["elastic_force_2"]["k_damp"]
         if "torsion_spring_central" in fh:
             vals["torsion_theta0_central"] = fh["torsion_spring_central"]["theta0"]
             vals["torsion_k_central"] = fh["torsion_spring_central"]["k"]
@@ -648,33 +652,43 @@ class MLP(nn.Module):
 
     def get_hyperparameter_penalty(
         self,
+        n_nodes: int,
         multiplier: float = 1.0,
-        n_nodes: int = 8,
         l_normalized: float = 1.0,
         base_k: float = 1.0,
+        base_k_damp: float | torch.Tensor = 1.0,
     ) -> torch.Tensor:
         """Computes a soft L2 penalty for any negative hyperparameters.
         Also adds penalty for out of bonds normalization, that is values greater than 1.
         """
         device = next(self.parameters()).device
         penalty = torch.tensor(0.0, device=device)
+        import math
 
         base_dr_value = torch.tensor(l_normalized / (n_nodes - 1))
 
         for k, p in self.hyper_params.items():
-            penalty += torch.sum(10 * torch.relu(-p) ** 2)
-            penalty += torch.sum(10 * torch.relu(p - 1) ** 2)
+            penalty += torch.sum(50 * torch.relu(-p) ** 2)  # Negative penalty
+            penalty += torch.sum(10 * torch.relu(p - 1) ** 2) # Above 1 penalty
 
             if k == "m":
-                penalty += torch.sum(0.1 * (p - (1 / n_nodes)) ** 2)
+                base_m = 1 / n_nodes
+                distance = torch.abs(p - base_m) / base_m
+                penalty += torch.sum(torch.relu(distance - 0.05) ** 2)
 
             if k == "elastic_k_1" or k == "elastic_k_2":
                 distance = torch.abs(p - base_k) / base_k
-                penalty += torch.sum(torch.relu(distance - 0.001) ** 2)
+                penalty += torch.sum(torch.relu(distance - 0.05) ** 2)
+
+            if k == "elastic_k_damp_1" or k == "elastic_k_damp_2":
+                distance = torch.abs(p - base_k_damp) / base_k_damp
+
+                penalty += torch.sum(50 * torch.relu(distance - 0.01) ** 2)
+                # penalty += torch.sum(50 * torch.relu(0.0001 - p) ** 2)
 
             if k == "elastic_dr_1" or k == "elastic_dr_2":
                 distance = torch.abs(p - base_dr_value) / base_dr_value
-                penalty += torch.sum(torch.relu(distance - 0.001) ** 2)
+                penalty += torch.sum(50 * torch.relu(distance - 0.01) ** 2)
 
         penalty *= multiplier
 
@@ -1050,7 +1064,7 @@ if __name__ == "__main__":
             mse_loss = nn.functional.mse_loss(pred, y_batch)
 
             # Penalize negative hyperparameters
-            penalty = model.get_hyperparameter_penalty()
+            penalty = model.get_hyperparameter_penalty(n_nodes=10)
             loss = mse_loss + 10.0 * penalty
 
             optimizer2.zero_grad()

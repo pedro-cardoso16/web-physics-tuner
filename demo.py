@@ -17,10 +17,10 @@ from wpt.utils.tools import normalize_data_for_neural_net
 
 if __name__ == "__main__":
     # Pre pipeline
-
+    import sys
     # 1. Generate synthetic dataset for training
     shard_dir = Path("tmp/data/shards")
-    # generate_dataset(shard_dir, seed=1, n_simulations=10000, n_iterations=300, n_nodes_max=10, max_workers=6)
+    # generate_dataset(shard_dir, seed=1, n_simulations=10_000, n_iterations=300, n_nodes_max=10, max_workers=6)
 
     # 2. Train the model
     # train_model(shard_dir, "models/pinn.pt", n_epochs=5, window_fraction=0.15, overwrite=True)
@@ -55,7 +55,7 @@ if __name__ == "__main__":
 
     # optimizer.coarse_optimize(
     #     normalized_video_data="tmp/data/video_output_normalized.json",
-    #     n_steps=5000,
+    #     n_steps=1000,
     #     device="cuda",
     #     lambda_consensus=15.0,
     #     output_file="coarse_retrieval_test.json",
@@ -77,7 +77,7 @@ if __name__ == "__main__":
 
     metadata = json.load(open(shard_dir / "metadata.json")) | {"total_range": total_range} | {"xy_min": normalized_ground_truth_metadata['xy_min']}
     data = simulate_chain_from_file(
-        "coarse_retrieval_test.json", n_turns=n_turns, dts=[0.1] * n_turns, metadata=metadata
+        "coarse_retrieval_test.json", n_turns=n_turns, dts=[0.001] * n_turns, metadata=metadata
     )
     
 
@@ -112,5 +112,5 @@ if __name__ == "__main__":
     from wpt.engine.game import run_engine_with_multiple_predefined_chain_paths
 
     run_engine_with_multiple_predefined_chain_paths(
-        [data, ground_truth_coords], dts=[0.1] * len(data), loop=True, framerate=60
+        [data, ], dts=[0.001] * len(data), loop=True, framerate=600
     )

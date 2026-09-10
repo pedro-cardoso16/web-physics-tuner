@@ -42,6 +42,7 @@ def create_mesh(
     h: int,
     step: float | np.ndarray,
     k: float,
+    k_damp: float | np.ndarray | None = None,
     **kwargs,
 ):
     """
@@ -77,6 +78,11 @@ def create_mesh(
         pos = np.array([x, y]) + top_left
         particles.append(Particle(m=kwargs.get("m", 1.0), x=pos))
 
+    if isinstance(k_damp, float | int):
+        k_damp = np.array([k_damp] * len(particles))
+    elif k_damp is None:
+        k_damp = np.array([None] * len(particles))
+
     # Connect each particle to its neighbors (following the verified playground logic)
     for i, particle in enumerate(particles):
         # Calculate row and col based on the layout: product(x_pos, y_pos)
@@ -104,7 +110,13 @@ def create_mesh(
             dr = kwargs.get("dr", step_x)
             # Add constraint to current particle
             particle.constraints.append(
-                make_elastic_constraint(particle, left_neighbor, kwargs.get("k", k), dr)
+                make_elastic_constraint(
+                    particle,
+                    left_neighbor,
+                    kwargs.get("k", k),
+                    dr,
+                    k_damp=k_damp[col - 1],
+                )
             )
 
             # Only add reverse constraint to neighbor if neighbor is NOT a pivot (row 0)
@@ -112,7 +124,7 @@ def create_mesh(
             if neighbor_row != 0:
                 left_neighbor.constraints.append(
                     make_elastic_constraint(
-                        left_neighbor, particle, kwargs.get("k", k), dr
+                        left_neighbor, particle, kwargs.get("k", k), dr, k_damp=k_damp[col - 1]
                     )
                 )
 
@@ -120,23 +132,21 @@ def create_mesh(
         if row > 0:
             top_neighbor = particles[col * h + (row - 1)]
             dr = kwargs.get("dr", step_y)
-
-            try: 
+           
+            try:
                 k_val = kwargs.get("k", k)[row - 1]
             except:
                 k_val = k
 
             particle.constraints.append(
-                make_elastic_constraint(particle, top_neighbor, k_val, dr)
+                make_elastic_constraint(particle, top_neighbor, k_val, dr,k_damp=k_damp[row - 1])
             )
 
             # Only add reverse constraint if top neighbor is NOT a pivot (row 0)
             neighbor_row = row - 1
             if neighbor_row != 0:
                 top_neighbor.constraints.append(
-                    make_elastic_constraint(
-                        top_neighbor, particle, k_val, dr
-                    )
+                    make_elastic_constraint(top_neighbor, particle, k_val, dr, k_damp=k_damp[row - 1])
                 )
 
     # simulation.particles.extend(particles)
@@ -232,7 +242,10 @@ def create_fibonacci_spiral_string(
 
     return particles
 
+
 from collections.abc import Iterable
+
+
 def create_curling_string(
     anchor: tuple | list | np.ndarray,
     n: int,
@@ -276,7 +289,6 @@ def create_curling_string(
         outer_1 = particles[i + 1]
         outer_2 = particles[i - 1]
 
-            
         c_constraint, o1_constraint, o2_constraint = make_torsion_spring_constraint(
             central, outer_1, outer_2, t0, tk, epsilon=epsilon
         )

@@ -3,7 +3,7 @@ import sys
 import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-
+from typing import Callable
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -67,6 +67,8 @@ def extract_nodes_properties(simulation: Simulation) -> list[dict]:
                         variables[key] = val.item()
                     except:
                         pass
+                if isinstance(val, Callable): # Remove callables from hyper-params
+                    variables[key] = None
 
             forces_hyperparams[force_type] = variables
 
@@ -91,6 +93,10 @@ def execution(**kwargs):
         "k_min": 20,
         "k_max_factor": 105,
         "k_min_factor": 95,
+        "k_damp_min_factor": 0.5,
+        "k_damp_max_factor": 1.5,
+        "k_damp_min":1,
+        "k_damp_max":1,
         "dampening_k_max": 10,
         "dampening_k_min": 0.1,
         "g_max": 1,
@@ -132,6 +138,14 @@ def execution(**kwargs):
 
     k = rng.uniform(default_kwargs["k_min_factor"], default_kwargs["k_max_factor"]) * g / step
 
+    particles_masses = rng.uniform(default_kwargs["m_min"], default_kwargs["m_max"], n_nodes)
+    particles_masses /= np.sum(particles_masses)
+
+    k_damp = rng.uniform(default_kwargs['k_damp_min_factor'], default_kwargs['k_damp_max_factor'], n_nodes-1) * 2 * np.sqrt(particles_masses[1:]*k)
+
+    # default_kwargs['k_damp_min'] = default_kwargs['k_damp_min_factor'] * 2 * np.sqrt(default_kwargs['k_min'])
+    # default_kwargs['k_damp_max'] = default_kwargs['k_damp_max_factor'] * 2 * np.sqrt(default_kwargs['k_max'])
+
     angle_rad = rng.uniform(
         default_kwargs["torsion_angle_min"],
         default_kwargs["torsion_angle_max"],
@@ -148,12 +162,8 @@ def execution(**kwargs):
         dr=step,
         g=np.array([0, g]),
         dampening=dampening_k,
+        k_damp=k_damp,
     )
-
-
-    particles_masses = rng.uniform(default_kwargs["m_min"], default_kwargs["m_max"], n_nodes)
-
-    particles_masses /= np.sum(particles_masses)
 
     for i, p in enumerate(particles):
         p.m = particles_masses[i]
@@ -229,6 +239,7 @@ def execution(**kwargs):
                 case "elastic_force_1" | "elastic_force_2":
                     k["dr"] /= total_range
                     k["k"] /= default_kwargs["k_max"]
+                    k["k_damp"] /= default_kwargs["k_damp_max"]
                     # k["k"] /= 100
                 case (
                     "torsion_spring_outer_1"
@@ -291,11 +302,13 @@ def generate_dataset(
         "n_nodes_min": 3,
         "k_max": 110,
         "k_min": 90,
-        "dampening_k_max": 0.001,
-        "dampening_k_min": 0.0001,
-        "g_max": 10,
-        "g_min": 8,
-        "torsion_k_max": 0.02,
+        "k_damp_max": 1.5,
+        "k_damp_min": 0.5,
+        "dampening_k_max": 0.0001,
+        "dampening_k_min": 0.00001,
+        "g_max": 200,
+        "g_min": 50,
+        "torsion_k_max": 2,
         "torsion_k_min": 0,
         "torsion_angle_max": 1.5 * np.pi,
         "torsion_angle_min": 0.5 * np.pi,
@@ -313,12 +326,18 @@ def generate_dataset(
     default_kwargs['k_max_factor'] = default_kwargs['k_max']
     default_kwargs['k_min_factor'] = default_kwargs['k_min']
 
+    default_kwargs['k_damp_max_factor'] = default_kwargs['k_damp_max']
+
+
     default_kwargs["k_max"] *= default_kwargs["g_max"] / default_kwargs["dr_min"]
     default_kwargs["k_min"] *= default_kwargs["g_min"] / default_kwargs["dr_max"]
 
     m_max = default_kwargs['m_max']
     default_kwargs['m_max'] /= m_max
     default_kwargs['m_min'] /= m_max
+
+    default_kwargs['k_damp_max'] *= 2*np.sqrt(default_kwargs['k_max'])
+    default_kwargs['k_damp_min'] *= 2*np.sqrt(default_kwargs['k_min'])
 
     shard_dir = Path(shard_dir)
 

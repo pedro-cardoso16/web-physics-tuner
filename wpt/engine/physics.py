@@ -156,6 +156,9 @@ class Simulation:
         self.elastic_indices_b = np.array([], dtype=np.int32)
         self.elastic_k = np.array([], dtype=np.float64)
         self.elastic_dr = np.array([], dtype=np.float64)
+        self.elastic_dampening_k = np.array([], dtype=np.float64)
+        # self.elastic_v_a = np.array([], dtype=np.float64)
+        self.elastic_v_b = np.array([], dtype=np.float64)
 
         self.gravity_indices = np.array([], dtype=np.int32)
         self.gravity_vecs = np.array([], dtype=np.float64)
@@ -182,7 +185,7 @@ class Simulation:
 
     def build_vectorized_constraints(self) -> None:
         """Compiles individual Particle constraints into vectorized NumPy arrays."""
-        e_owner, e_a, e_b, e_k, e_dr = [], [], [], [], []
+        e_owner, e_a, e_b, e_k, e_dr, e_kd = [], [], [], [], [], []
         g_idx, g_vec = [], []
         d_idx, d_k = [], []
         t_central, t_outer1, t_outer2, t_theta0, t_k, t_eps = [], [], [], [], [], []
@@ -269,6 +272,7 @@ class Simulation:
                             e_b.append(x2_idx)
                             e_k.append(getattr(ref, "k"))
                             e_dr.append(getattr(ref, "dr"))
+                            e_kd.append(getattr(ref, "k_damp"))
                         except ValueError:
                             pass
                 # Check for gravitational constraints
@@ -288,6 +292,9 @@ class Simulation:
         self.elastic_indices_a = np.array(e_a, dtype=np.int32)
         self.elastic_indices_b = np.array(e_b, dtype=np.int32)
         self.elastic_k = np.array(e_k, dtype=np.float64)
+        self.elastic_dampening_k = np.array(e_kd, dtype=np.float64)
+        # self.elastic_v_a = np.array(e_v_a, dtype=np.float64)
+        # self.elastic_v_b = np.array(e_v_b, dtype=np.float64)
         self.elastic_dr = np.array(e_dr, dtype=np.float64)
 
         self.gravity_indices = np.array(g_idx, dtype=np.int32)
@@ -341,10 +348,12 @@ class Simulation:
 
             if self.elastic_indices_a.size > 0:
                 f_elastic = elastic_force(
-                    self.pos[self.elastic_indices_a],
-                    self.pos[self.elastic_indices_b],
-                    self.elastic_k[:, np.newaxis],
-                    self.elastic_dr[:, np.newaxis],
+                    x1=self.pos[self.elastic_indices_a],
+                    x2=self.pos[self.elastic_indices_b],
+                    k=self.elastic_k[:, np.newaxis],
+                    dr=self.elastic_dr[:, np.newaxis],
+                    k_damp=self.elastic_dampening_k[:, np.newaxis],
+                    v=self.vel[self.elastic_indices_a] - self.vel[self.elastic_indices_b],
                 )
                 np.add.at(net_forces, self.elastic_owner_indices, f_elastic)
 
@@ -424,8 +433,8 @@ def elastic_force(
     d_min: float | np.ndarray = 1e-16,
     d_max: float | np.ndarray = np.finfo("float").max / 1000,
     max_force: float = 1e6,  # tune to whatever scale is physically sensible for your sim
-    k_damp: None| float = None,
-    v: None| np.ndarray = None,
+    k_damp: None | np.ndarray = None,
+    v: None | np.ndarray | Callable = None,
 ) -> np.ndarray:
     dx = x2 - x1
     d = np.linalg.norm(dx, axis=-1, keepdims=True)
@@ -442,17 +451,25 @@ def elastic_force(
 
     # Elastic dampening effect
     if v is not None and k_damp is not None:
-        if k_damp < 0:
+        if np.any(k_damp < 0):
             raise ValueError("k_damp must be a non-negative value.")
-    
-        v_proj = v.dot(dxu) * dxu # projection along the connection line
-        f += -k_damp * v_proj 
+
+
+        v_val = v() if isinstance(v, Callable) else v
+
+        v_proj = dxu * np.diag(v_val @ dxu.T).reshape(-1, 1) # projection along the connection line
+        f += -k_damp * v_proj
 
     return f
 
 
 def make_elastic_constraint(
-    particle1: Particle, particle2: Particle, k: float, dr: float, d_min: float = 1e-16
+    particle1: Particle,
+    particle2: Particle,
+    k: float,
+    dr: float,
+    d_min: float = 1e-16,
+    k_damp: float | None = None,
 ) -> Constraint:
     """
     Create an elastic force constraint from two Particle instances.
@@ -464,13 +481,21 @@ def make_elastic_constraint(
         particle2: Second Particle instance
         k: Spring constant
         dr: Rest distance
-        d_min: Minimum distance to avoid force explosion
+        d_min: Minimum distance to avoid force explosion. Defaults to `1e-16`.
+        k_damp: Elastic dampening constant. Defaults to `None`.
 
     Returns:
         Constraint: Ready-to-use constraint for particles
     """
     # Store particles directly so we always access current positions
-    ref = Reference(x1=particle1, x2=particle2, k=k, dr=dr, d_min=d_min)
+    ref = Reference(
+        x1=particle1,
+        x2=particle2,
+        k=k,
+        dr=dr,
+        d_min=d_min,
+        k_damp=k_damp,
+    )
 
     # Create wrapper function that extracts positions on-demand
     def elastic_force_wrapper(**kwargs):
@@ -479,9 +504,11 @@ def make_elastic_constraint(
         return elastic_force(
             p1.x if isinstance(p1, Particle) else p1,
             p2.x if isinstance(p2, Particle) else p2,
-            kwargs["k"],
-            kwargs["dr"],
-            kwargs["d_min"],
+            k=kwargs["k"],
+            dr=kwargs["dr"],
+            d_min=kwargs["d_min"],
+            k_damp=kwargs["k_damp"],
+            v=lambda: p1.v - p2.v if isinstance(p1, Particle) and isinstance(p2, Particle) else kwargs["v"],
         )
 
     return Constraint(elastic_force_wrapper, reference=ref)
@@ -712,7 +739,7 @@ def torsion_spring_force(
     # Rows where either segment is degenerate (too short) get zero force.
     degenerate = (len1 < epsilon) | (len2 < epsilon)
 
-    # Safe denominators (avoid div-by-zero warnings on degenerate rows;
+    # Safe denominators (avoid div-by-zero warnings on degenerate rows
     # those rows get masked to zero at the end regardless).
     len1_safe = np.where(len1 < epsilon, 1.0, len1)
     len2_safe = np.where(len2 < epsilon, 1.0, len2)
@@ -720,8 +747,12 @@ def torsion_spring_force(
     # v1_normalized = v1 / len1_safe
     # v2_normalized = v2 / len2_safe
 
-    v1_normalized = np.divide(v1, len1_safe, out=np.zeros_like(v1), where=len1_safe != 0)
-    v2_normalized = np.divide(v2, len2_safe, out=np.zeros_like(v2), where=len2_safe != 0)
+    v1_normalized = np.divide(
+        v1, len1_safe, out=np.zeros_like(v1), where=len1_safe != 0
+    )
+    v2_normalized = np.divide(
+        v2, len2_safe, out=np.zeros_like(v2), where=len2_safe != 0
+    )
 
     # 1. Dot and 2D "cross" (z-component only) products, per row
     dot_product = np.sum(v1_normalized * v2_normalized, axis=1, keepdims=True)

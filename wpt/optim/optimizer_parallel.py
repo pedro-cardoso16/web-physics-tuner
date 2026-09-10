@@ -3,6 +3,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import pandas as pd
+import numpy as np
 from wpt.nn.model import (
     MLP,
     TrainDataset,
@@ -30,15 +31,22 @@ def get_active_keys_for_node(i: int, n_nodes: int) -> list[str]:
     """
     if i == 0:
         return (
-            []
+            ["m"]
         )  # Pivot/anchor node is completely static and has no active constraints
 
     # All moving nodes experience gravity, dampening, and their parent spring connection
-    active = ["m", "g", "dampening_k", "elastic_k_1", "elastic_dr_1"]
+    active = [
+        "m",
+        "g",
+        "dampening_k",
+        "elastic_k_1",
+        "elastic_dr_1",
+        "elastic_k_damp_1",
+    ]
 
     # If not the tip node, it experiences a child spring connection
     if i < n_nodes - 1:
-        active.extend(["elastic_k_2", "elastic_dr_2"])
+        active.extend(["elastic_k_2", "elastic_dr_2", "elastic_k_damp_2"])
 
     # Joint centers range from 1 to N-2
     if 1 <= i <= n_nodes - 2:
@@ -121,7 +129,7 @@ def optimize_parallel_machines(
     l = l_normalized * data["original_range"]["total_range"]
 
     base_k = initial_g * dr_min * (n_nodes - 1) / l
-    print(base_k)
+    base_k_damp = 2 * np.sqrt(base_k) * 0.9
     for i in range(n_nodes):
         active_keys = get_active_keys_for_node(i, n_nodes)
 
@@ -130,12 +138,14 @@ def optimize_parallel_machines(
         machines[i].setup_hyperparameters_tuning(
             optimize_keys=active_keys,
             initial_val={
-                "m": 1/n_nodes,
+                "m": 1 / n_nodes,
                 "g": initial_g,
                 "elastic_k_1": base_k,
                 "elastic_k_2": base_k,
                 "elastic_dr_1": l_normalized / (n_nodes - 1),
                 "elastic_dr_2": l_normalized / (n_nodes - 1),
+                "elastic_k_damp_1": base_k_damp,
+                "elastic_k_damp_2": base_k_damp,
             },
             default_val=0.8,
         )
@@ -148,6 +158,8 @@ def optimize_parallel_machines(
         params_to_optimize.extend(
             [p for p in machines[i].parameters() if p.requires_grad]
         )
+
+    params_to_optimize.append(machines[0].hyper_params['m']) # Only add the mass of the pivot node
 
     optimizer = torch.optim.Adam(params_to_optimize, lr=lr)
 
@@ -167,8 +179,14 @@ def optimize_parallel_machines(
             pred = machines[i](x_all[i], hp=None)
             mse_loss = nn.functional.mse_loss(pred, y_all[i])
             # Penalty of negative hyper-parameters.
+            # base_k_damp = 2 * torch.sqrt(machines[i].hyper_params["elastic_k_1"])
+            base_k = machines[i].hyper_params['g'] * dr_min * (n_nodes - 1) / l
+            base_k_damp = 2* torch.sqrt(base_k) * 0.9
             neg_penalty = machines[i].get_hyperparameter_penalty(
-                n_nodes=n_nodes, l_normalized=l_normalized, base_k=base_k
+                n_nodes=n_nodes,
+                l_normalized=l_normalized,
+                base_k=base_k,
+                base_k_damp=base_k_damp,
             )
             # non_normalization_penalty = machines[i].get_hyperparameter_penalty()
 
@@ -189,9 +207,13 @@ def optimize_parallel_machines(
         )
         damp_consensus = torch.sum((damp_vals - torch.mean(damp_vals)) ** 2)
 
+        m_vals = torch.stack([machines[i].hyper_params["m"] for i in range(0, n_nodes)])
+        m_consensus = (torch.sum(m_vals) - 1) ** 2
+
         # Elastic spring consensus (coupling elastic_k_2 at node i-1 to elastic_k_1 at node i)
         elastic_k_diffs = []
         elastic_dr_diffs = []
+        elastic_k_damp_diffs = []
 
         for i in range(2, n_nodes):
             elastic_k_diffs.append(
@@ -208,6 +230,13 @@ def optimize_parallel_machines(
                 )
                 ** 2
             )
+            elastic_k_damp_diffs.append(
+                (
+                    machines[i].hyper_params["elastic_k_damp_1"]
+                    - machines[i - 1].hyper_params["elastic_k_damp_2"]
+                )
+                ** 2
+            )
 
         elastic_k_consensus = (
             torch.sum(torch.stack(elastic_k_diffs))
@@ -217,6 +246,11 @@ def optimize_parallel_machines(
         elastic_dr_consensus = (
             torch.sum(torch.stack(elastic_dr_diffs))
             if elastic_dr_diffs
+            else torch.tensor(0.0, device=device)
+        )
+        elastic_k_damp_consensus = (
+            torch.sum(torch.stack(elastic_k_damp_diffs))
+            if elastic_k_damp_diffs
             else torch.tensor(0.0, device=device)
         )
 
@@ -254,9 +288,11 @@ def optimize_parallel_machines(
             + lambda_consensus
             * (
                 g_consensus
+                + m_consensus
                 + damp_consensus
                 + elastic_k_consensus
                 + elastic_dr_consensus
+                + elastic_k_damp_consensus
                 + torsion_k_penalty
                 + torsion_theta_penalty
             )
@@ -277,9 +313,11 @@ def optimize_parallel_machines(
     for i in range(n_nodes):
         print(f"\n>>> Node {i} parameter discovery:")
         if i == 0:
-            print("  [Stationary Pivot Node - All parameters locked at 0.0]")
+            print("  [Stationary Pivot Node - All parameters locked at 0.0, except m]")
             p_true = [0.0] * len(HP_KEYS)
             p_rec = [0.0] * len(HP_KEYS)
+
+            p_rec[HP_KEYS.index("m")] = machines[i].hyper_params['m'].item()
             p_err = [0.0] * len(HP_KEYS)
             p_status = ["Static Pivot"] * len(HP_KEYS)
         else:
@@ -299,6 +337,10 @@ def optimize_parallel_machines(
                 # t_val = datasets[i].hp[idx].item()
                 r_val = machines[i].hyper_params[k].item()
                 # p_true.append(t_val)
+
+                # if i == 0 and k != 'm':
+                #     r_val = 0
+
                 p_rec.append(r_val)
                 # p_err.append(abs(t_val - r_val))
 
@@ -429,7 +471,7 @@ def optimize_parallel_system(
         for i in range(1, n_nodes):
             pred = machines[i](x_all[i], hp=None)
             mse_loss = nn.functional.mse_loss(pred, y_all[i])
-            neg_penalty = machines[i].get_hyperparameter_penalty()
+            neg_penalty = machines[i].get_hyperparameter_penalty(n_nodes=n_nodes)
 
             local_losses.append(mse_loss)
             neg_penalties.append(neg_penalty)
@@ -451,6 +493,8 @@ def optimize_parallel_system(
         # Elastic spring consensus (coupling elastic_k_2 at node i-1 to elastic_k_1 at node i)
         elastic_k_diffs = []
         elastic_dr_diffs = []
+        elastic_k_damp_diffs = []
+
         for i in range(2, n_nodes):
             elastic_k_diffs.append(
                 (
@@ -466,6 +510,13 @@ def optimize_parallel_system(
                 )
                 ** 2
             )
+            elastic_k_damp_diffs.append(
+                (
+                    machines[i].hyper_params["elastic_k_damp_1"]
+                    - machines[i - 1].hyper_params["elastic_k_damp_2"]
+                )
+                ** 2
+            )
 
         elastic_k_consensus = (
             torch.sum(torch.stack(elastic_k_diffs))
@@ -475,6 +526,11 @@ def optimize_parallel_system(
         elastic_dr_consensus = (
             torch.sum(torch.stack(elastic_dr_diffs))
             if elastic_dr_diffs
+            else torch.tensor(0.0, device=device)
+        )
+        elastic_k_damp_consensus = (
+            torch.sum(torch.stack(elastic_k_damp_diffs))
+            if elastic_k_damp_diffs
             else torch.tensor(0.0, device=device)
         )
 
@@ -515,6 +571,7 @@ def optimize_parallel_system(
                 + damp_consensus
                 + elastic_k_consensus
                 + elastic_dr_consensus
+                + elastic_k_damp_consensus
                 + torsion_k_penalty
                 + torsion_theta_penalty
             )
