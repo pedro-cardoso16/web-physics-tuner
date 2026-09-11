@@ -1,4 +1,6 @@
 import pygame as pg
+import numpy as np
+from numpy.typing import ArrayLike
 from .physics import *
 from typing import Literal, Iterable
 

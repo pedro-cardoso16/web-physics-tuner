@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+import torch
+import math
+
 from .physics import *
 from itertools import product
 
@@ -37,22 +42,22 @@ def get_neighbors(i: int, w: int, h: int) -> list[tuple[int, str]]:
 
 
 def create_mesh(
-    top_left: tuple | list | np.ndarray,
+    top_left: tuple | list | torch.Tensor,
     w: int,
     h: int,
-    step: float | np.ndarray,
+    step: float | torch.Tensor,
     k: float,
-    k_damp: float | np.ndarray | None = None,
+    k_damp: float | torch.Tensor | None = None,
     **kwargs,
 ):
     """
 
     Args:
         simulation (Simulation): target simulation object to add the mesh.
-        top_left (tuple | list | np.ndarray): position of the top-left mesh node.
+        top_left (tuple | list | torch.Tensor): position of the top-left mesh node.
         w (int): width, number of horizontal nodes
         h (int): height, number of vertical nodes
-        step (float | np.ndarray): distance between nodes
+        step (float | torch.Tensor): distance between nodes
 
         kwargs (Any): additional params to set for the forces
             - m (float | ArrayLike): nodes' mass
@@ -61,27 +66,27 @@ def create_mesh(
             - a (float): first order dampening parameter
             - b (float): second order dampening parameter
     """
-    top_left = np.array(top_left)
+    top_left = torch.as_tensor(top_left, dtype=torch.float64)
 
-    if isinstance(step, (list, tuple, np.ndarray)):
+    if isinstance(step, (list, tuple, torch.Tensor)):
         step_x, step_y = step[0], step[1]
     else:
         step_x, step_y = step, step
 
-    x_pos = np.arange(0, w) * step_x
-    y_pos = np.arange(0, h) * step_y
+    x_pos = torch.arange(0, w, dtype=torch.float64) * step_x
+    y_pos = torch.arange(0, h, dtype=torch.float64) * step_y
 
     xy_pos = product(x_pos, y_pos)
     particles = []
 
     for x, y in xy_pos:
-        pos = np.array([x, y]) + top_left
+        pos = torch.stack((x, y)) + top_left
         particles.append(Particle(m=kwargs.get("m", 1.0), x=pos))
 
-    if isinstance(k_damp, float | int):
-        k_damp = np.array([k_damp] * len(particles))
+    if isinstance(k_damp, (float, int)):
+        k_damp = torch.full((len(particles),), k_damp, dtype=torch.float64)
     elif k_damp is None:
-        k_damp = np.array([None] * len(particles))
+        k_damp = torch.zeros(len(particles), dtype=torch.float64)
 
     # Connect each particle to its neighbors (following the verified playground logic)
     for i, particle in enumerate(particles):
@@ -95,7 +100,7 @@ def create_mesh(
 
         # Gravity on all non-pivot particles
         gravitational_constraint = make_gravitational_constraint(
-            particle, kwargs.get("g", np.array([0, 1]))
+            particle, kwargs.get("g", torch.tensor([0.0, 1.0]))
         )
         particle.constraints.append(gravitational_constraint)
 
@@ -155,9 +160,9 @@ def create_mesh(
 
 
 def create_string(
-    anchor: tuple | list | np.ndarray,
+    anchor: tuple | list | torch.Tensor,
     n: int,
-    step: float | np.ndarray,
+    step: float | torch.Tensor,
     k: float,
     **kwargs,
 ):
@@ -167,11 +172,11 @@ def create_string(
 
 
 def create_fibonacci_spiral_string(
-    center: tuple | list | np.ndarray,
+    center: tuple | list | torch.Tensor,
     n: int,
     k: float,
     a: float = 1.0,
-    theta_step: float = np.pi / 8,
+    theta_step: float = math.pi / 8,
     **kwargs,
 ):
     """
@@ -195,20 +200,20 @@ def create_fibonacci_spiral_string(
                 (defaults to each segment's actual initial length, since spacing
                 grows along the spiral and a single fixed dr would fight that shape)
             * dampening (float): dampening constant
-            * g (np.ndarray): gravity vector
+            * g (torch.Tensor): gravity vector
 
     Returns:
         list[Particle]: particles ordered from the spiral's center outward
     """
-    center = np.array(center)
-    phi = (1 + np.sqrt(5)) / 2
-    b = np.log(phi) / (np.pi / 2)
+    center = torch.as_tensor(center, dtype=torch.float64)
+    phi = (1 + torch.sqrt(torch.tensor(5.0))) / 2
+    b = torch.log(phi) / (torch.pi / 2)
 
     particles = []
     for i in range(n):
         theta = i * theta_step
-        r = a * np.exp(b * theta)
-        pos = center + r * np.array([np.cos(theta), np.sin(theta)])
+        r = a * torch.exp(b * theta)
+        pos = center + r * torch.stack((torch.cos(torch.as_tensor(theta)), torch.sin(torch.as_tensor(theta))))
         particles.append(Particle(m=kwargs.get("m", 1.0), x=pos))
 
     dr_override = kwargs.get("dr", None)
@@ -218,7 +223,7 @@ def create_fibonacci_spiral_string(
             continue  # pivot, like row 0 in create_mesh
 
         particle.constraints.append(
-            make_gravitational_constraint(particle, kwargs.get("g", np.array([0, 500])))
+            make_gravitational_constraint(particle, kwargs.get("g", torch.tensor([0.0, 500.0])))
         )
         particle.constraints.append(
             make_dampening_constraint(particle, kwargs.get("dampening", 0.02))
@@ -228,7 +233,7 @@ def create_fibonacci_spiral_string(
         segment_dr = (
             dr_override
             if dr_override is not None
-            else np.linalg.norm(particle.x - prev_particle.x)
+            else torch.linalg.vector_norm(particle.x - prev_particle.x).item()
         )
 
         particle.constraints.append(
@@ -247,9 +252,9 @@ from collections.abc import Iterable
 
 
 def create_curling_string(
-    anchor: tuple | list | np.ndarray,
+    anchor: tuple | list | torch.Tensor,
     n: int,
-    step: float | np.ndarray,
+    step: float | torch.Tensor,
     k: float,
     theta0: float | Iterable,
     torsion_k: float | Iterable,

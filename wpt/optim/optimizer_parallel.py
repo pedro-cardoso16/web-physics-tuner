@@ -745,20 +745,27 @@ def fit_hyper_parameters(
     start_coords: torch.Tensor | Any,
     start_velocities: torch.Tensor | Any,
     simulation: Simulation | None,
-    start_hyper_parameters: list[dict] = [{}],
+    start_hyper_parameters: list[dict] | None = None,
+    target_positions: torch.Tensor | Any | None = None,
+    n_frames: int = 1,
+    optimizer: torch.optim.Optimizer | None = None,
 ):
     """
 
     Function responsible for the fine optimization process. Uses pytorch
     """
+    start_coords = torch.as_tensor(start_coords, dtype=torch.float64)
+    start_velocities = torch.as_tensor(start_velocities, dtype=torch.float64)
     n_nodes = len(start_coords)
+    start_hyper_parameters = start_hyper_parameters or [{} for _ in range(n_nodes)]
     if simulation is None:
         simulation = Simulation()
     else:
         simulation.clear()
 
     particles = [
-        Particle(1.0, start_coords[i], start_velocities[i]) for i in range(n_nodes)
+        Particle(node_hyper_parameters.get("m", 1.0), start_coords[i], start_velocities[i])
+        for i, node_hyper_parameters in enumerate(start_hyper_parameters)
     ]
 
     for i, (node_hyper_parameters, particle) in enumerate(
@@ -772,47 +779,43 @@ def fit_hyper_parameters(
             constraints.append(
                 make_gravitational_constraint(particle, node_hyper_parameters["g"])
             )
-        constraints.append(
-            make_elastic_constraint(
-                particle,
-                particles[i + 1],
+        if i < n_nodes - 1 and "elastic_k_1" in node_hyper_parameters:
+            constraints.append(make_elastic_constraint(
+                particle, particles[i + 1],
                 node_hyper_parameters["elastic_k_1"],
                 node_hyper_parameters["elastic_dr_1"],
-            )
-        )
-        constraints.append(
-            make_elastic_constraint(
-                particle,
-                particles[i - 1],
+                k_damp=node_hyper_parameters.get("elastic_k_damp_1"),
+            ))
+        if i > 0 and "elastic_k_2" in node_hyper_parameters:
+            constraints.append(make_elastic_constraint(
+                particle, particles[i - 1],
                 node_hyper_parameters["elastic_k_2"],
                 node_hyper_parameters["elastic_dr_2"],
-            )
-        )
+                k_damp=node_hyper_parameters.get("elastic_k_damp_2"),
+            ))
 
         particle.constraints.extend(constraints)
 
-    import torch
-
-    # --- Simulation run with pytorch enabled ---
-    loss = torch.tensor([])
-
-    from torch.nn.functional import mse_loss
-
-    # optim = torch.optim.Adam()
-    # simulation.build_vectorized_constraints()
-
-    # for i in range(n_frames):
-    #     input_val = simulation.particles.x
-    #     simulation.run(n=1)
-    #     from dataset_generator import extract_nodes_properties
-    #     target = simulation.particles.x
-    #     loss += mse_loss(input=,target=target)
-
-    # loss.backward()
-    # optim.step()
-    # optim.zero_grad()
-
-    # --- Grad calculation ---
+    simulation.particles = particles
+    simulation.build_vectorized_constraints()
+    target = (
+        torch.as_tensor(target_positions, dtype=simulation.pos.dtype, device=simulation.pos.device)
+        if target_positions is not None
+        else start_coords.to(simulation.pos)
+    )
+    if optimizer is None:
+        parameters = [value for hp in start_hyper_parameters for value in hp.values()
+                      if isinstance(value, torch.Tensor) and value.requires_grad]
+        optimizer = torch.optim.Adam(parameters, lr=1e-3) if parameters else None
+    loss = torch.zeros((), dtype=simulation.pos.dtype, device=simulation.pos.device)
+    for _ in range(n_frames):
+        simulation.run(n=1)
+        loss = loss + torch.nn.functional.mse_loss(simulation.pos, target)
+    if optimizer is not None:
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    return loss
 
 
 if __name__ == "__main__":

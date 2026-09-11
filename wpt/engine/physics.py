@@ -1,10 +1,29 @@
-import numpy as np
-import time
-import matplotlib.pyplot as plt
-from typing import Callable, Literal
-from numpy.typing import ArrayLike, NDArray
+from __future__ import annotations
 
-# from numba import vectorize
+import math
+from collections.abc import Callable
+from typing import Any
+
+import torch
+from torch import Tensor
+
+
+def _tensor(value: Any, *, dtype: torch.dtype = torch.float64) -> Tensor:
+    """Convert values without copying or detaching an existing tensor."""
+    if isinstance(value, Tensor):
+        return value.to(dtype=dtype)
+    return torch.as_tensor(value, dtype=dtype)
+
+
+def _index(value: Any, device: torch.device) -> Tensor:
+    return torch.as_tensor(value, dtype=torch.long, device=device)
+
+
+def _stack_values(values: list[Any], *, dtype: torch.dtype, device: torch.device) -> Tensor:
+    if not values:
+        return torch.empty(0, dtype=dtype, device=device)
+    tensors = [_tensor(value, dtype=dtype).to(device) for value in values]
+    return torch.stack([value.reshape(()) for value in tensors])
 
 
 class Reference:
@@ -15,953 +34,351 @@ class Reference:
 
 class Constraint:
     def __init__(self, func: Callable, reference: Reference) -> None:
-        self.func: Callable[[], float | np.ndarray] = func
-        # self.target: Particle = target
+        self.func = func
         self.reference = reference
 
-    def compute_force(self) -> np.ndarray:
-        kwargs = vars(self.reference)
-        return self.func(**kwargs)  # type: ignore
+    def compute_force(self) -> Tensor:
+        return self.func(**vars(self.reference))
 
 
 class Particle:
-    def __init__(
-        self,
-        m: float | None = None,
-        x: ArrayLike | None = None,
-        v: ArrayLike | None = None,
-        a: ArrayLike | None = None,
-    ) -> None:
-        self.m = m  # mass
-        self.x: np.ndarray = np.array(x)  # current position
-        self.v: np.ndarray = (
-            np.array(v) if v is not None else np.zeros_like(x)
-        )  # current velocity
-        self.a: np.ndarray = (
-            np.array(a) if a is not None else np.zeros_like(x)
-        )  # current acceleration
-        self.f: np.ndarray = np.zeros_like(self.x)
-        self.xp: np.ndarray | None = None
-        self.vp: np.ndarray = self.v.copy()
-
+    def __init__(self, m=None, x=None, v=None, a=None) -> None:
+        if x is None:
+            raise ValueError("Particle position x must be provided.")
+        self.m = m
+        self.x = _tensor(x)
+        self.v = _tensor(v if v is not None else torch.zeros_like(self.x))
+        self.a = _tensor(a if a is not None else torch.zeros_like(self.x))
+        self.f = torch.zeros_like(self.x)
+        self.xp: Tensor | None = None
+        self.vp = self.v.clone()
         self.constraints: list[Constraint] = []
 
-    def compute_acceleration(self, net_force: np.ndarray | None = None) -> np.ndarray:
-        """Compute acceleration
-
-        Args:
-            net_force (np.ndarray | None): net force acting on the particle. If
-                `None`, will compute the force based on the constraints. Defaults to `None`
-        """
+    def compute_acceleration(self, net_force: Tensor | None = None) -> Tensor:
         if net_force is None:
             net_force = self.compute_force()
             if net_force is None:
-                return np.array([])
-
+                return torch.empty(0, dtype=self.x.dtype, device=self.x.device)
         if self.m is None:
-            raise ValueError(
-                "The particle's mass is not defined, please set a positive value."
-            )
+            raise ValueError("The particle's mass is not defined, please set a positive value.")
+        self.a = net_force / _tensor(self.m, dtype=self.x.dtype)
+        return self.a
 
-        a = net_force / self.m
-
-        self.a = a
-        return a
-
-    def compute_velocity(self, dt) -> np.ndarray:
-        self.vp[:] = self.v[:]
-        self.v[:] = (self.x - self.xp) / dt
-
+    def compute_velocity(self, dt: float) -> Tensor:
+        self.vp = self.v.clone()
+        self.v = (self.x - self.xp) / dt
         return self.v
 
-    def update_vars(self, dt, dtp: None | float = None) -> None:
+    def update_vars(self, dt: float, dtp: float | None = None) -> None:
         if self.xp is None:
-            self.xp = self.x[:]
+            self.xp = self.x.clone()
             self.x = self.x + self.v * dt + 0.5 * self.a * dt**2
-            self.v = self.compute_velocity(dt)
-            return
-
-        # Calculate next position using Störmer-Verlet
-        xn = stromer(self.x, self.xp, self.a, dt, dtp)
-
-        # Update the previous position
-        self.xp[:] = self.x[:]
-
-        # change current position to the next one
-        self.x = xn
-
+        else:
+            self.xp, self.x = self.x, stromer(self.x, self.xp, self.a, dt, dtp)
         self.v = self.compute_velocity(dt)
 
-    def compute_force(self) -> np.ndarray | None:
-        # raise NotImplementedError("Particle instance must implement compute_force()")
-        if self.constraints is None:
-            return
-
-        net_force = 0
-
+    def compute_force(self) -> Tensor | None:
+        if not self.constraints:
+            return None
+        force = torch.zeros_like(self.x)
         for constraint in self.constraints:
-            net_force += constraint.compute_force()
-
-        self.f[:] = net_force
-        return self.f
+            force = force + constraint.compute_force()
+        self.f = force
+        return force
 
 
 class Simulation:
-    def __init__(self, particles: list[Particle] = []) -> None:
+    def __init__(self, particles: list[Particle] | None = None) -> None:
         self.dt = 0.001
-        self.dtp = None
-        self.particles = particles
+        self.dtp: float | None = None
+        self.particles = particles or []
 
     @property
     def particles(self) -> list[Particle]:
         return self.__particles
 
     @particles.setter
-    def particles(self, x: list[Particle]) -> None:
-        self.__particles = x
+    def particles(self, value: list[Particle]) -> None:
+        self.__particles = value
         self.__build_vectorized_params()
 
     def __build_vectorized_params(self) -> None:
-        # Vectorized state arrays
-        particles = self.particles
-
-        self.num_particles = len(particles)
-
-        if self.num_particles > 0:
-            self.pos = np.array([p.x for p in particles], dtype=np.float64)
-            self.vel = np.array([p.v for p in particles], dtype=np.float64)
-            self.prev_vel = np.array([p.vp for p in particles], dtype=np.float64)
-            self.acc = np.array([p.a for p in particles], dtype=np.float64)
-            self.prev_pos = np.array(
-                [
-                    p.xp if p.xp is not None else (p.x - p.v * self.dt)
-                    for p in particles
-                ],
-                dtype=np.float64,
-            )
-            self.masses = np.array([p.m for p in particles], dtype=np.float64).reshape(
-                -1, 1
-            )
+        self.num_particles = len(self.particles)
+        if self.num_particles:
+            device = self.particles[0].x.device
+            self.pos = torch.stack([p.x for p in self.particles])
+            self.vel = torch.stack([p.v for p in self.particles])
+            self.prev_vel = torch.stack([p.vp for p in self.particles])
+            self.acc = torch.stack([p.a for p in self.particles])
+            self.prev_pos = torch.stack([
+                p.xp if p.xp is not None else p.x - p.v * self.dt
+                for p in self.particles
+            ])
+            self.masses = torch.stack([
+                _tensor(p.m, dtype=self.pos.dtype).reshape(())
+                for p in self.particles
+            ]).reshape(-1, 1)
         else:
-            self.pos = np.array([], dtype=np.float64)
-            self.vel = np.array([], dtype=np.float64)
-            self.prev_vel = np.array([], dtype=np.float64)
-            self.acc = np.array([], dtype=np.float64)
-            self.prev_pos = np.array([], dtype=np.float64)
-            self.masses = np.array([], dtype=np.float64)
+            device = torch.device("cpu")
+            self.pos = torch.empty((0, 2), dtype=torch.float64, device=device)
+            self.vel = self.pos.clone()
+            self.prev_vel = self.pos.clone()
+            self.acc = self.pos.clone()
+            self.prev_pos = self.pos.clone()
+            self.masses = torch.empty((0, 1), dtype=torch.float64, device=device)
 
-        # Vectorized constraint caches
-        self.elastic_owner_indices = np.array([], dtype=np.int32)
-        self.elastic_indices_a = np.array([], dtype=np.int32)
-        self.elastic_indices_b = np.array([], dtype=np.int32)
-        self.elastic_k = np.array([], dtype=np.float64)
-        self.elastic_dr = np.array([], dtype=np.float64)
-        self.elastic_dampening_k = np.array([], dtype=np.float64)
-        # self.elastic_v_a = np.array([], dtype=np.float64)
-        self.elastic_v_b = np.array([], dtype=np.float64)
-
-        self.gravity_indices = np.array([], dtype=np.int32)
-        self.gravity_vecs = np.array([], dtype=np.float64)
-
-        self.dampening_indices = np.array([], dtype=np.int32)
-        self.dampening_k = np.array([], dtype=np.float64)
-
-        self.torsion_central_indices = np.array([], dtype=np.int32)
-        self.torsion_outer1_indices = np.array([], dtype=np.int32)
-        self.torsion_outer2_indices = np.array([], dtype=np.int32)
-        self.torsion_theta0 = np.array([], dtype=np.float64)
-        self.torsion_k = np.array([], dtype=np.float64)
-        self.torsion_epsilon = np.array([], dtype=np.float64)
-
-        self.rigid_owner_indices = np.array([], dtype=np.int32)
-        self.rigid_pivot_indices = np.array([], dtype=np.int32)
-        self.rigid_d_fixed = np.array([], dtype=np.float64)
-        self.rigid_dt = np.array([], dtype=np.float64)
-
-        self.rope_owner_indices = np.array([], dtype=np.int32)
-        self.rope_pivot_indices = np.array([], dtype=np.int32)
-        self.rope_d_max = np.array([], dtype=np.float64)
-        self.rope_dt = np.array([], dtype=np.float64)
+        empty_i = torch.empty(0, dtype=torch.long, device=device)
+        empty_f = torch.empty(0, dtype=self.pos.dtype, device=device)
+        self.elastic_owner_indices = empty_i
+        self.elastic_indices_a = empty_i
+        self.elastic_indices_b = empty_i
+        self.elastic_k = empty_f
+        self.elastic_dr = empty_f
+        self.elastic_dampening_k = empty_f
+        self.gravity_indices = empty_i
+        self.gravity_vecs = torch.empty((0, 2), dtype=self.pos.dtype, device=device)
+        self.dampening_indices = empty_i
+        self.dampening_k = empty_f
+        self.torsion_central_indices = empty_i
+        self.torsion_outer1_indices = empty_i
+        self.torsion_outer2_indices = empty_i
+        self.torsion_theta0 = empty_f
+        self.torsion_k = empty_f
+        self.torsion_epsilon = empty_f
+        self.rigid_owner_indices = empty_i
+        self.rigid_pivot_indices = empty_i
+        self.rigid_d_fixed = empty_f
+        self.rigid_dt = empty_f
+        self.rope_owner_indices = empty_i
+        self.rope_pivot_indices = empty_i
+        self.rope_d_max = empty_f
+        self.rope_dt = empty_f
 
     def build_vectorized_constraints(self) -> None:
-        """Compiles individual Particle constraints into vectorized NumPy arrays."""
         e_owner, e_a, e_b, e_k, e_dr, e_kd = [], [], [], [], [], []
-        g_idx, g_vec = [], []
-        d_idx, d_k = [], []
-        t_central, t_outer1, t_outer2, t_theta0, t_k, t_eps = [], [], [], [], [], []
-        r_owner, r_pivot, r_dfixed, r_dt = [], [], [], []
-        rope_owner, rope_pivot, rope_dmax, rope_dt = [], [], [], []
-        seen_torsion_refs: set[int] = set()
-
-        for idx, p in enumerate(self.particles):
-            for c in p.constraints:
-                ref = c.reference
-
-                # Check for torsion spring constraints (checked first: the
-                # same `ref` is shared by all three Constraints of a joint,
-                # so dedupe by identity and only add each joint once)
-                if (
-                    hasattr(ref, "central_particle")
-                    and hasattr(ref, "outer_particle_1")
-                    and hasattr(ref, "outer_particle_2")
-                    and hasattr(ref, "theta0")
-                ):
-                    if id(ref) in seen_torsion_refs:
+        g_idx, g_vec, d_idx, d_k = [], [], [], []
+        tc, to1, to2, tt, tk, te = [], [], [], [], [], []
+        ro, rp, rdf, rdt, rpo, rpp, rdm, rdtp = [], [], [], [], [], [], [], []
+        seen: set[int] = set()
+        for idx, particle in enumerate(self.particles):
+            for constraint in particle.constraints:
+                ref = constraint.reference
+                if all(hasattr(ref, x) for x in ("central_particle", "outer_particle_1", "outer_particle_2", "theta0")):
+                    if id(ref) in seen:
                         continue
                     try:
-                        c_idx = self.particles.index(ref.central_particle)  # type: ignore
-                        o1_idx = self.particles.index(ref.outer_particle_1)  # type: ignore
-                        o2_idx = self.particles.index(ref.outer_particle_2)  # type: ignore
+                        tc.append(self.particles.index(ref.central_particle))
+                        to1.append(self.particles.index(ref.outer_particle_1))
+                        to2.append(self.particles.index(ref.outer_particle_2))
                     except ValueError:
                         continue
-                    seen_torsion_refs.add(id(ref))
-                    t_central.append(c_idx)
-                    t_outer1.append(o1_idx)
-                    t_outer2.append(o2_idx)
-                    t_theta0.append(getattr(ref, "theta0"))
-                    t_k.append(getattr(ref, "k"))
-                    t_eps.append(getattr(ref, "epsilon", 1e-4))
-
-                # Check for rigid connection constraints
-                elif (
-                    hasattr(ref, "particle")
-                    and hasattr(ref, "pivot_particle")
-                    and hasattr(ref, "d_fixed")
-                    and hasattr(ref, "dt")
-                ):
-                    try:
-                        pivot_idx = self.particles.index(ref.pivot_particle)  # type: ignore
-                    except ValueError:
-                        continue
-                    r_owner.append(idx)
-                    r_pivot.append(pivot_idx)
-                    r_dfixed.append(getattr(ref, "d_fixed"))
-                    r_dt.append(getattr(ref, "dt"))
-
-                # Check for rope constraints
-                elif (
-                    hasattr(ref, "particle")
-                    and hasattr(ref, "pivot_particle")
-                    and hasattr(ref, "d_max")
-                    and hasattr(ref, "dt")
-                ):
-                    try:
-                        pivot_idx = self.particles.index(ref.pivot_particle)  # type: ignore
-                    except ValueError:
-                        continue
-                    rope_owner.append(idx)
-                    rope_pivot.append(pivot_idx)
-                    rope_dmax.append(getattr(ref, "d_max"))
-                    rope_dt.append(getattr(ref, "dt"))
-
-                # Check for elastic constraints
-                elif (
-                    hasattr(ref, "x1")
-                    and hasattr(ref, "x2")
-                    and hasattr(ref, "k")
-                    and hasattr(ref, "dr")
-                ):
-                    x1_attr = getattr(ref, "x1", None)
-                    x2_attr = getattr(ref, "x2", None)
-                    if isinstance(x1_attr, Particle) and isinstance(x2_attr, Particle):
+                    seen.add(id(ref))
+                    tt.append(ref.theta0); tk.append(ref.k); te.append(getattr(ref, "epsilon", 1e-4))
+                elif all(hasattr(ref, x) for x in ("particle", "pivot_particle", "d_fixed", "dt")):
+                    try: pivot = self.particles.index(ref.pivot_particle)
+                    except ValueError: continue
+                    ro.append(idx); rp.append(pivot); rdf.append(ref.d_fixed); rdt.append(ref.dt)
+                elif all(hasattr(ref, x) for x in ("particle", "pivot_particle", "d_max", "dt")):
+                    try: pivot = self.particles.index(ref.pivot_particle)
+                    except ValueError: continue
+                    rpo.append(idx); rpp.append(pivot); rdm.append(ref.d_max); rdtp.append(ref.dt)
+                elif all(hasattr(ref, x) for x in ("x1", "x2", "k", "dr")):
+                    if isinstance(ref.x1, Particle) and isinstance(ref.x2, Particle):
                         try:
-                            x1_idx = self.particles.index(x1_attr)
-                            x2_idx = self.particles.index(x2_attr)
-                            e_owner.append(idx)
-                            e_a.append(x1_idx)
-                            e_b.append(x2_idx)
-                            e_k.append(getattr(ref, "k"))
-                            e_dr.append(getattr(ref, "dr"))
-                            e_kd.append(getattr(ref, "k_damp"))
-                        except ValueError:
-                            pass
-                # Check for gravitational constraints
+                            e_owner.append(idx); e_a.append(self.particles.index(ref.x1)); e_b.append(self.particles.index(ref.x2))
+                        except ValueError: continue
+                        e_k.append(ref.k); e_dr.append(ref.dr); e_kd.append(ref.k_damp if ref.k_damp is not None else 0.0)
                 elif hasattr(ref, "g") and hasattr(ref, "particle"):
-                    g_idx.append(idx)
-                    g_vec.append(getattr(ref, "g"))
-                # Check for dampening constraints
-                elif (
-                    hasattr(ref, "k")
-                    and hasattr(ref, "particle")
-                    and not hasattr(ref, "x1")
-                ):
-                    d_idx.append(idx)
-                    d_k.append(getattr(ref, "k"))
+                    g_idx.append(idx); g_vec.append(ref.g)
+                elif hasattr(ref, "k") and hasattr(ref, "particle") and not hasattr(ref, "x1"):
+                    d_idx.append(idx); d_k.append(ref.k)
 
-        self.elastic_owner_indices = np.array(e_owner, dtype=np.int32)
-        self.elastic_indices_a = np.array(e_a, dtype=np.int32)
-        self.elastic_indices_b = np.array(e_b, dtype=np.int32)
-        self.elastic_k = np.array(e_k, dtype=np.float64)
-        self.elastic_dampening_k = np.array(e_kd, dtype=np.float64)
-        # self.elastic_v_a = np.array(e_v_a, dtype=np.float64)
-        # self.elastic_v_b = np.array(e_v_b, dtype=np.float64)
-        self.elastic_dr = np.array(e_dr, dtype=np.float64)
-
-        self.gravity_indices = np.array(g_idx, dtype=np.int32)
-        self.gravity_vecs = np.array(g_vec, dtype=np.float64)
-
-        self.dampening_indices = np.array(d_idx, dtype=np.int32)
-        self.dampening_k = np.array(d_k, dtype=np.float64)
-
-        self.torsion_central_indices = np.array(t_central, dtype=np.int32)
-        self.torsion_outer1_indices = np.array(t_outer1, dtype=np.int32)
-        self.torsion_outer2_indices = np.array(t_outer2, dtype=np.int32)
-        self.torsion_theta0 = np.array(t_theta0, dtype=np.float64)
-        self.torsion_k = np.array(t_k, dtype=np.float64)
-        self.torsion_epsilon = np.array(t_eps, dtype=np.float64)
-
-        self.rigid_owner_indices = np.array(r_owner, dtype=np.int32)
-        self.rigid_pivot_indices = np.array(r_pivot, dtype=np.int32)
-        self.rigid_d_fixed = np.array(r_dfixed, dtype=np.float64)
-        self.rigid_dt = np.array(r_dt, dtype=np.float64)
-
-        self.rope_owner_indices = np.array(rope_owner, dtype=np.int32)
-        self.rope_pivot_indices = np.array(rope_pivot, dtype=np.int32)
-        self.rope_d_max = np.array(rope_dmax, dtype=np.float64)
-        self.rope_dt = np.array(rope_dt, dtype=np.float64)
+        device, dtype = self.pos.device, self.pos.dtype
+        def inds(values): return torch.as_tensor(values, dtype=torch.long, device=device)
+        def vals(values): return _stack_values(values, dtype=dtype, device=device)
+        def vectors(values):
+            if not values:
+                return torch.empty((0, 2), dtype=dtype, device=device)
+            return torch.stack([_tensor(value, dtype=dtype).to(device).reshape(2) for value in values])
+        self.elastic_owner_indices, self.elastic_indices_a, self.elastic_indices_b = inds(e_owner), inds(e_a), inds(e_b)
+        self.elastic_k, self.elastic_dr, self.elastic_dampening_k = vals(e_k), vals(e_dr), vals(e_kd)
+        self.gravity_indices, self.gravity_vecs = inds(g_idx), vectors(g_vec)
+        self.dampening_indices, self.dampening_k = inds(d_idx), vals(d_k)
+        self.torsion_central_indices, self.torsion_outer1_indices, self.torsion_outer2_indices = inds(tc), inds(to1), inds(to2)
+        self.torsion_theta0, self.torsion_k, self.torsion_epsilon = vals(tt), vals(tk), vals(te)
+        self.rigid_owner_indices, self.rigid_pivot_indices = inds(ro), inds(rp)
+        self.rigid_d_fixed, self.rigid_dt = vals(rdf), vals(rdt)
+        self.rope_owner_indices, self.rope_pivot_indices = inds(rpo), inds(rpp)
+        self.rope_d_max, self.rope_dt = vals(rdm), vals(rdtp)
 
     def run(self, n: int | None = None) -> None:
-        if self.num_particles == 0:
+        if not self.num_particles:
             return
-
-        # Particles with no constraints stay frozen (0 acceleration)
-        fixed_mask = np.array([len(p.constraints) == 0 for p in self.particles])
-
+        fixed = torch.tensor([not p.constraints for p in self.particles], device=self.pos.device)
         i = 0
-        while True:
-            if n is not None and i >= n:
-                break
-
-            # 1. Vectorized force computation - calls the same force functions
-            #    used by individual constraints, just with batched inputs.
-            net_forces = np.zeros((self.num_particles, 2), dtype=np.float64)
-
-            if self.gravity_indices.size > 0:
-                net_forces[self.gravity_indices] += gravitational_force(
-                    self.masses[self.gravity_indices], self.gravity_vecs
-                )
-
-            if self.dampening_indices.size > 0:
-                net_forces[self.dampening_indices] += dampening_force(
-                    self.dampening_k[:, np.newaxis], self.vel[self.dampening_indices]
-                )
-
-            if self.elastic_indices_a.size > 0:
-                f_elastic = elastic_force(
-                    x1=self.pos[self.elastic_indices_a],
-                    x2=self.pos[self.elastic_indices_b],
-                    k=self.elastic_k[:, np.newaxis],
-                    dr=self.elastic_dr[:, np.newaxis],
-                    k_damp=self.elastic_dampening_k[:, np.newaxis],
-                    v=self.vel[self.elastic_indices_a] - self.vel[self.elastic_indices_b],
-                )
-                np.add.at(net_forces, self.elastic_owner_indices, f_elastic)
-
-            if self.torsion_central_indices.size > 0:
-                central_forces, outer1_forces, outer2_forces = torsion_spring_force(
-                    self.torsion_theta0[:, np.newaxis],
-                    self.torsion_k[:, np.newaxis],
-                    self.pos[self.torsion_outer1_indices]
-                    - self.pos[self.torsion_central_indices],
-                    self.pos[self.torsion_outer2_indices]
-                    - self.pos[self.torsion_central_indices],
-                    self.torsion_epsilon[:, np.newaxis],
-                )
-
-                np.add.at(net_forces, self.torsion_central_indices, central_forces)
-                np.add.at(net_forces, self.torsion_outer1_indices, outer1_forces)
-                np.add.at(net_forces, self.torsion_outer2_indices, outer2_forces)
-
-            if self.rigid_owner_indices.size > 0:
-                f_rigid = rigid_connection_force(
-                    self.masses[self.rigid_owner_indices],
-                    self.pos[self.rigid_owner_indices],
-                    self.vel[self.rigid_owner_indices],
-                    self.pos[self.rigid_pivot_indices],
-                    self.vel[self.rigid_pivot_indices],
-                    self.rigid_d_fixed[:, np.newaxis],
-                    self.rigid_dt[:, np.newaxis],
-                )
-                np.add.at(net_forces, self.rigid_owner_indices, f_rigid)
-
-            if self.rope_owner_indices.size > 0:
-                f_rope = rope_force(
-                    self.masses[self.rope_owner_indices],
-                    self.pos[self.rope_owner_indices],
-                    self.vel[self.rope_owner_indices],
-                    self.pos[self.rope_pivot_indices],
-                    self.vel[self.rope_pivot_indices],
-                    self.rope_d_max[:, np.newaxis],
-                    self.rope_dt[:, np.newaxis],
-                )
-                np.add.at(net_forces, self.rope_owner_indices, f_rope)
-
-            # 2. Vectorized acceleration: a = F / m
-            self.acc = net_forces / self.masses
-            self.acc[fixed_mask] = 0
-
-            # 3. Vectorized Stormer-Verlet integration (reuses `stromer`)
-            next_pos = stromer(self.pos, self.prev_pos, self.acc, self.dt, self.dtp)
-            self.dtp = self.dt  # save previous time step
-            self.prev_pos = self.pos.copy()
-            self.pos = next_pos
-
-            # 4. Vectorized velocity: v = (x - xp) / dt
-            self.prev_vel = self.vel.copy()
-            self.vel = (self.pos - self.prev_pos) / self.dt
-
+        while n is None or i < n:
+            forces = torch.zeros_like(self.pos)
+            if self.gravity_indices.numel():
+                forces = forces.index_add(0, self.gravity_indices, gravitational_force(self.masses[self.gravity_indices], self.gravity_vecs))
+            if self.dampening_indices.numel():
+                forces = forces.index_add(0, self.dampening_indices, dampening_force(self.dampening_k[:, None], self.vel[self.dampening_indices]))
+            if self.elastic_indices_a.numel():
+                f = elastic_force(self.pos[self.elastic_indices_a], self.pos[self.elastic_indices_b], self.elastic_k[:, None], self.elastic_dr[:, None], k_damp=self.elastic_dampening_k[:, None], v=self.vel[self.elastic_indices_a] - self.vel[self.elastic_indices_b])
+                forces = forces.index_add(0, self.elastic_owner_indices, f)
+            if self.torsion_central_indices.numel():
+                f0, f1, f2 = torsion_spring_force(self.torsion_theta0[:, None], self.torsion_k[:, None], self.pos[self.torsion_outer1_indices] - self.pos[self.torsion_central_indices], self.pos[self.torsion_outer2_indices] - self.pos[self.torsion_central_indices], self.torsion_epsilon[:, None])
+                for indices, force in ((self.torsion_central_indices, f0), (self.torsion_outer1_indices, f1), (self.torsion_outer2_indices, f2)):
+                    forces = forces.index_add(0, indices, force)
+            if self.rigid_owner_indices.numel():
+                forces = forces.index_add(0, self.rigid_owner_indices, rigid_connection_force(self.masses[self.rigid_owner_indices], self.pos[self.rigid_owner_indices], self.vel[self.rigid_owner_indices], self.pos[self.rigid_pivot_indices], self.vel[self.rigid_pivot_indices], self.rigid_d_fixed[:, None], self.rigid_dt[:, None]))
+            if self.rope_owner_indices.numel():
+                forces = forces.index_add(0, self.rope_owner_indices, rope_force(self.masses[self.rope_owner_indices], self.pos[self.rope_owner_indices], self.vel[self.rope_owner_indices], self.pos[self.rope_pivot_indices], self.vel[self.rope_pivot_indices], self.rope_d_max[:, None], self.rope_dt[:, None]))
+            acceleration = torch.where(fixed[:, None], torch.zeros_like(forces), forces / self.masses)
+            next_pos = stromer(self.pos, self.prev_pos, acceleration, self.dt, self.dtp)
+            self.dtp = self.dt
+            self.prev_pos, self.pos = self.pos, next_pos
+            self.prev_vel, self.vel = self.vel, (self.pos - self.prev_pos) / self.dt
+            self.acc = acceleration
             i += 1
-
-        # Sync the vectorized state back to the particle objects once, at the end
         for idx, particle in enumerate(self.particles):
-            particle.x = self.pos[idx]
-            particle.v = self.vel[idx]
-            particle.vp = self.prev_vel[idx]
-            particle.a = self.acc[idx]
-            particle.xp = self.prev_pos[idx]
+            particle.x, particle.v, particle.vp, particle.a, particle.xp = self.pos[idx], self.vel[idx], self.prev_vel[idx], self.acc[idx], self.prev_pos[idx]
 
     def clear(self) -> None:
         self.particles.clear()
         self.__build_vectorized_params()
 
 
-def elastic_force(
-    x1: np.ndarray,
-    x2: np.ndarray,
-    k: float | np.ndarray,
-    dr: float | np.ndarray,
-    d_min: float | np.ndarray = 1e-16,
-    d_max: float | np.ndarray = np.finfo("float").max / 1000,
-    max_force: float = 1e6,  # tune to whatever scale is physically sensible for your sim
-    k_damp: None | np.ndarray = None,
-    v: None | np.ndarray | Callable = None,
-) -> np.ndarray:
-    dx = x2 - x1
-    d = np.linalg.norm(dx, axis=-1, keepdims=True)
-
-    # select between itself and allowed distance range, avoids force explosion.
-    d = np.minimum(np.maximum(d, d_min), d_max)
-
-    dxu = dx / d  # dx unitary vector
-
-    mag = k * (d - dr)
-    mag = np.clip(mag, -max_force, max_force)  # the actual overflow guard
-
-    f = dxu * mag  # force
-
-    # Elastic dampening effect
-    if v is not None and k_damp is not None:
-        if np.any(k_damp < 0):
-            raise ValueError("k_damp must be a non-negative value.")
-
-
-        v_val = v() if isinstance(v, Callable) else v
-
-        v_proj = dxu * np.diag(v_val @ dxu.T).reshape(-1, 1) # projection along the connection line
-        f += -k_damp * v_proj
-
-    return f
-
-
-def make_elastic_constraint(
-    particle1: Particle,
-    particle2: Particle,
-    k: float,
-    dr: float,
-    d_min: float = 1e-16,
-    k_damp: float | None = None,
-) -> Constraint:
-    """
-    Create an elastic force constraint from two Particle instances.
-
-    Automatically extracts positions from particles and creates a Reference + Constraint.
-
-    Args:
-        particle1: First Particle instance
-        particle2: Second Particle instance
-        k: Spring constant
-        dr: Rest distance
-        d_min: Minimum distance to avoid force explosion. Defaults to `1e-16`.
-        k_damp: Elastic dampening constant. Defaults to `None`.
-
-    Returns:
-        Constraint: Ready-to-use constraint for particles
-    """
-    # Store particles directly so we always access current positions
-    ref = Reference(
-        x1=particle1,
-        x2=particle2,
-        k=k,
-        dr=dr,
-        d_min=d_min,
-        k_damp=k_damp,
-    )
-
-    # Create wrapper function that extracts positions on-demand
-    def elastic_force_wrapper(**kwargs):
-        p1 = kwargs["x1"]
-        p2 = kwargs["x2"]
-        return elastic_force(
-            p1.x if isinstance(p1, Particle) else p1,
-            p2.x if isinstance(p2, Particle) else p2,
-            k=kwargs["k"],
-            dr=kwargs["dr"],
-            d_min=kwargs["d_min"],
-            k_damp=kwargs["k_damp"],
-            v=lambda: p1.v - p2.v if isinstance(p1, Particle) and isinstance(p2, Particle) else kwargs["v"],
-        )
-
-    return Constraint(elastic_force_wrapper, reference=ref)
-
-
-def gravitational_force(m: float | np.ndarray, g: np.ndarray = np.array((0.0, 9.8))):
-    if np.any(np.asarray(m) <= 0):
+def gravitational_force(m, g=(0.0, 9.8)):
+    mass = _tensor(m)
+    if torch.any(mass <= 0):
         raise ValueError("The mass (m) must be a positive number.")
+    return mass * _tensor(g).reshape(-1, 2) if mass.ndim > 1 else mass * _tensor(g)
 
-    return m * g
 
-
-def make_gravitational_constraint(
-    particle: Particle, g: np.ndarray = np.array((0.0, 9.8))
-) -> Constraint:
-    """
-    Create a gravitational force constraint from a Particle instance.
-
-    Args:
-        particle: Particle instance
-        g: Gravitational acceleration vector (default: (0, 9.8))
-
-    Returns:
-        Constraint: Ready-to-use constraint for the particle
-    """
+def make_gravitational_constraint(particle, g=(0.0, 9.8)):
     ref = Reference(particle=particle, g=g)
-
-    def gravitational_force_wrapper(**kwargs):
-        p = kwargs["particle"]
-        return gravitational_force(p.m, kwargs["g"])
-
-    return Constraint(gravitational_force_wrapper, reference=ref)
+    return Constraint(lambda **kw: gravitational_force(kw["particle"].m, kw["g"]), ref)
 
 
-def dampening_force(k: float | np.ndarray, v: np.ndarray) -> np.ndarray:
-    magnitude = np.linalg.norm(v, axis=-1, keepdims=True)
-    return -k * magnitude * v
+def dampening_force(k, v):
+    velocity = _tensor(v)
+    return -_tensor(k).reshape(-1, 1) * torch.linalg.vector_norm(velocity, dim=-1, keepdim=True) * velocity
 
 
-def make_dampening_constraint(particle: Particle, k: float) -> Constraint:
-    """
-    Create a dampening force constraint from a Particle instance.
-
-    Args:
-        particle: Particle instance
-        k: Dampening coefficient
-
-    Returns:
-        Constraint: Ready-to-use constraint for the particle
-    """
+def make_dampening_constraint(particle, k):
     ref = Reference(particle=particle, k=k)
-
-    def dampening_force_wrapper(**kwargs):
-        p = kwargs["particle"]
-        return dampening_force(kwargs["k"], p.v)
-
-    return Constraint(dampening_force_wrapper, reference=ref)
+    return Constraint(lambda **kw: dampening_force(kw["k"], kw["particle"].v), ref)
 
 
-def rigid_connection_force(
-    mass: float | np.ndarray,
-    pos: np.ndarray,
-    velocity: np.ndarray,
-    pivot_pos: np.ndarray,
-    pivot_velocity: np.ndarray,
-    d_fixed: float | np.ndarray,
-    dt: float | np.ndarray,
-) -> np.ndarray:
-    """Rigid connection force
-
-    This force fixates the distance between the particle and the pivot. It calculates
-    the force assuming the pivot has infinite mass, that is all the force is applied to the
-    particle.
-
-    **This is like the elastic force with infinite elastic constant value.**
-
-    Args:
-        mass (float): Particle's mass.
-        pos (np.ndarray): Particle's current position.
-        velocity (np.ndarray): Particle's current velocity.
-        pivot_pos (np.ndarray): Pivot's current position.
-        pivot_velocity (np.ndarray): Pivot's current velocity.
-        d_fixed (float): Fixed distance between the pivot and the particle.
-        dt (float): Time interval into the future.
-
-    Returns:
-        f (np.ndarray): Net force required for position correction into the future.
-            Doesn't take into account other external forces, only current particle
-            and pivot's positions and velocities.
-    """
-    future_rel_pos = (pos - pivot_pos) + dt * (velocity - pivot_velocity)
-    future_rel_pos_norm = np.linalg.norm(future_rel_pos, axis=-1, keepdims=True)
-    future_rel_pos_normalized = future_rel_pos / future_rel_pos_norm
-
-    f = -(mass / dt**2) * (future_rel_pos_norm - d_fixed) * future_rel_pos_normalized
-    return f
+def elastic_force(x1, x2, k, dr, d_min=1e-16, d_max=float("1e300"), max_force=1e6, k_damp=None, v=None):
+    x1, x2 = _tensor(x1), _tensor(x2)
+    dx = x2 - x1
+    distance = torch.linalg.vector_norm(dx, dim=-1, keepdim=True)
+    safe_distance = distance.clamp(min=d_min, max=d_max)
+    unit = dx / safe_distance
+    magnitude = (_tensor(k) * (safe_distance - _tensor(dr))).clamp(-max_force, max_force)
+    force = unit * magnitude
+    if v is not None and k_damp is not None:
+        if torch.any(_tensor(k_damp) < 0):
+            raise ValueError("k_damp must be a non-negative value.")
+        velocity = v() if callable(v) else _tensor(v)
+        projection = unit * (velocity * unit).sum(dim=-1, keepdim=True)
+        force = force - _tensor(k_damp).reshape(-1, 1) * projection
+    return force
 
 
-def make_rigid_connection_constraint(
-    particle: Particle, pivot_particle: Particle, d_fixed: float, dt: float
-) -> Constraint:
-    """
-    Create a rigid connection force constraint from two Particle instances.
-
-    Args:
-        particle: The particle to apply force to
-        pivot_particle: The pivot/fixed particle
-        d_fixed: Fixed distance between particles
-        dt: Time interval
-
-    Returns:
-        Constraint: Ready-to-use constraint
-    """
-    ref = Reference(
-        particle=particle, pivot_particle=pivot_particle, d_fixed=d_fixed, dt=dt
-    )
-
-    def rigid_connection_wrapper(**kwargs):
-        p = kwargs["particle"]
-        pp = kwargs["pivot_particle"]
-        return rigid_connection_force(
-            p.m, p.x, p.v, pp.x, pp.v, kwargs["d_fixed"], kwargs["dt"]
-        )
-
-    return Constraint(rigid_connection_wrapper, reference=ref)
+def make_elastic_constraint(particle1, particle2, k, dr, d_min=1e-16, k_damp=None):
+    ref = Reference(x1=particle1, x2=particle2, k=k, dr=dr, d_min=d_min, k_damp=k_damp)
+    def wrapper(**kw):
+        p1, p2 = kw["x1"], kw["x2"]
+        return elastic_force(p1.x, p2.x, kw["k"], kw["dr"], kw["d_min"], k_damp=kw["k_damp"], v=lambda: p1.v - p2.v)
+    return Constraint(wrapper, ref)
 
 
-def rope_force(
-    mass: float | np.ndarray,
-    pos: np.ndarray,
-    velocity: np.ndarray,
-    pivot_pos: np.ndarray,
-    pivot_velocity: np.ndarray,
-    d_max: float | np.ndarray,
-    dt: float | np.ndarray,
-) -> np.ndarray:
-    """Rope connection force
-
-    This force fixates the maximum distance between the particle and the pivot.
-    It works exactly as [`rigid_connection_force`](rigit_connection_force) when
-    the distance is predicted to be above `d_max` `dt` seconds into the future.
-    It simply returns a zero-valued force otherwise.
-
-    Args:
-        mass (float): Particle's mass.
-        pos (np.ndarray): Particle's current position.
-        velocity (np.ndarray): Particle's current velocity.
-        pivot_pos (np.ndarray): Pivot's current position.
-        pivot_velocity (np.ndarray): Pivot's current velocity.
-        d_max (float): Max distance between the pivot and the particle.
-            Equivalent to a rope's length.
-        dt (float): Time interval into the future.
-
-    Returns:
-        f (np.ndarray): Net force required for position correction into the future.
-            Doesn't take into account other external forces, only current particle
-            and pivot's positions and velocities.
-    """
-    future_rel_pos = (pos - pivot_pos) + dt * (velocity - pivot_velocity)
-    future_rel_pos_norm = np.linalg.norm(future_rel_pos, axis=-1, keepdims=True)
-
-    # Row is "slack" (rope not taut) when within d_max, mask instead of `if`,
-    # same pattern as torsion_spring_force's `degenerate` mask.
-    slack = future_rel_pos_norm <= d_max
-    norm_safe = np.where(
-        slack, 1.0, future_rel_pos_norm
-    )  # avoid div-by-zero on slack rows
-    future_rel_pos_normalized = future_rel_pos / norm_safe
-
-    f = -(mass / dt**2) * (future_rel_pos_norm - d_max) * future_rel_pos_normalized
-    f = np.where(slack, 0.0, f)
-    return f
+def rigid_connection_force(mass, pos, velocity, pivot_pos, pivot_velocity, d_fixed, dt):
+    relative = _tensor(pos) - _tensor(pivot_pos) + _tensor(dt) * (_tensor(velocity) - _tensor(pivot_velocity))
+    norm = torch.linalg.vector_norm(relative, dim=-1, keepdim=True).clamp_min(1e-16)
+    return -_tensor(mass) / _tensor(dt).square() * (norm - _tensor(d_fixed)) * relative / norm
 
 
-def make_rope_constraint(
-    particle: Particle, pivot_particle: Particle, d_max: float, dt: float
-) -> Constraint:
-    """
-    Create a rope force constraint from two Particle instances.
-
-    Args:
-        particle: The particle to apply force to
-        pivot_particle: The pivot/fixed particle
-        d_max: Maximum distance (rope length)
-        dt: Time interval
-
-    Returns:
-        Constraint: Ready-to-use constraint
-    """
-    ref = Reference(
-        particle=particle, pivot_particle=pivot_particle, d_max=d_max, dt=dt
-    )
-
-    def rope_wrapper(**kwargs):
-        p = kwargs["particle"]
-        pp = kwargs["pivot_particle"]
-        return rope_force(p.m, p.x, p.v, pp.x, pp.v, kwargs["d_max"], kwargs["dt"])
-
-    return Constraint(rope_wrapper, reference=ref)
+def make_rigid_connection_constraint(particle, pivot_particle, d_fixed, dt):
+    ref = Reference(particle=particle, pivot_particle=pivot_particle, d_fixed=d_fixed, dt=dt)
+    return Constraint(lambda **kw: rigid_connection_force(kw["particle"].m, kw["particle"].x, kw["particle"].v, kw["pivot_particle"].x, kw["pivot_particle"].v, kw["d_fixed"], kw["dt"]), ref)
 
 
-def torsion_spring_force(
-    theta0: float | np.ndarray,  # Target angle(s), shape (m,) or (m,1) or scalar
-    k: float | np.ndarray,  # Stiffness coefficient(s), shape (m,) or (m,1) or scalar
-    v1: np.ndarray,  # Vector(s) from Center to Node A, shape (m, 2) or (2,)
-    v2: np.ndarray,  # Vector(s) from Center to Node C, shape (m, 2) or (2,)
-    epsilon: float | np.ndarray = 1e-4,  # Security threshold, scalar or (m,)/(m,1)
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    # Normalize everything to 2D batched form; remember if input was a single
-    # joint (1D vectors) so we can squeeze the output back to match.
-    single_joint = np.ndim(v1) == 1
-
-    v1 = np.atleast_2d(np.asarray(v1, dtype=np.float64))
-    v2 = np.atleast_2d(np.asarray(v2, dtype=np.float64))
-    m = v1.shape[0]
-
-    theta0 = np.broadcast_to(
-        np.asarray(theta0, dtype=np.float64).reshape(-1, 1), (m, 1)
-    )
-    k = np.broadcast_to(np.asarray(k, dtype=np.float64).reshape(-1, 1), (m, 1))
-    epsilon = np.broadcast_to(
-        np.asarray(epsilon, dtype=np.float64).reshape(-1, 1), (m, 1)
-    )
-
-    len1 = np.linalg.norm(v1, axis=1, keepdims=True)
-    len2 = np.linalg.norm(v2, axis=1, keepdims=True)
-
-    # Rows where either segment is degenerate (too short) get zero force.
-    degenerate = (len1 < epsilon) | (len2 < epsilon)
-
-    # Safe denominators (avoid div-by-zero warnings on degenerate rows
-    # those rows get masked to zero at the end regardless).
-    len1_safe = np.where(len1 < epsilon, 1.0, len1)
-    len2_safe = np.where(len2 < epsilon, 1.0, len2)
-
-    # v1_normalized = v1 / len1_safe
-    # v2_normalized = v2 / len2_safe
-
-    v1_normalized = np.divide(
-        v1, len1_safe, out=np.zeros_like(v1), where=len1_safe != 0
-    )
-    v2_normalized = np.divide(
-        v2, len2_safe, out=np.zeros_like(v2), where=len2_safe != 0
-    )
-
-    # 1. Dot and 2D "cross" (z-component only) products, per row
-    dot_product = np.sum(v1_normalized * v2_normalized, axis=1, keepdims=True)
-    cross_z = (
-        v1_normalized[:, 0] * v2_normalized[:, 1]
-        - v1_normalized[:, 1] * v2_normalized[:, 0]
-    ).reshape(-1, 1)
-    # Matches original: np.linalg.norm of a cross product with only a z
-    # component equals abs(cross_z), so theta stays in [0, pi] just as before.
-    theta = np.arctan2(np.abs(cross_z), dot_product)
-
-    # 2. Linear delta theta calculation
-    delta_theta = theta - theta0
-    delta_theta_sign = np.sign(delta_theta)
-
-    # 3. Central Force Vector along the bisector
-    bisector = v1_normalized + v2_normalized
-    bisector_len = np.linalg.norm(bisector, axis=1, keepdims=True)
-    bisector_degenerate = bisector_len < epsilon
-    bisector_len_safe = np.where(bisector_degenerate, 1.0, bisector_len)
-
-    fallback_direction = np.column_stack([-v1_normalized[:, 1], v1_normalized[:, 0]])
-    direction = np.where(
-        bisector_degenerate, fallback_direction, bisector / bisector_len_safe
-    )
-
-    central_magnitude = 2 * k * delta_theta * np.cos(delta_theta / 2)
-    central_force = -delta_theta_sign * central_magnitude * direction
-
-    # 4. Outer Forces perpendicular to their respective segments
-    v1_perpendicular = np.column_stack([-v1_normalized[:, 1], v1_normalized[:, 0]])
-    v2_perpendicular = np.column_stack([v2_normalized[:, 1], -v2_normalized[:, 0]])
-
-    torque_scalar = delta_theta_sign * k * delta_theta
-    outer_force_1 = (torque_scalar / len1_safe) * v1_perpendicular
-    outer_force_2 = (torque_scalar / len2_safe) * v2_perpendicular
-
-    # Zero out degenerate rows across all three outputs
-    central_force = np.where(degenerate, 0.0, central_force)
-    outer_force_1 = np.where(degenerate, 0.0, outer_force_1)
-    outer_force_2 = np.where(degenerate, 0.0, outer_force_2)
-
-    # # Fallback in case of NaN values
-    # central_force = np.where(
-    #     np.isnan(central_force) | np.isinf(central_force), 0.0, central_force
-    # )
-    # outer_force_1 = np.where(
-    #     np.isnan(outer_force_1) | np.isinf(outer_force_1), 0.0, outer_force_1
-    # )
-    # outer_force_2 = np.where(
-    #     np.isnan(outer_force_2) | np.isinf(outer_force_2), 0.0, outer_force_2
-    # )
-
-    if single_joint:
-        return central_force[0], outer_force_1[0], outer_force_2[0]
-
-    return central_force, outer_force_1, outer_force_2
+def rope_force(mass, pos, velocity, pivot_pos, pivot_velocity, d_max, dt):
+    relative = _tensor(pos) - _tensor(pivot_pos) + _tensor(dt) * (_tensor(velocity) - _tensor(pivot_velocity))
+    norm = torch.linalg.vector_norm(relative, dim=-1, keepdim=True)
+    slack = norm <= _tensor(d_max)
+    safe = torch.where(slack, torch.ones_like(norm), norm)
+    force = -_tensor(mass) / _tensor(dt).square() * (norm - _tensor(d_max)) * relative / safe
+    return torch.where(slack, torch.zeros_like(force), force)
 
 
-def make_torsion_spring_constraint(
-    central_particle: Particle,
-    outer_particle_1: Particle,
-    outer_particle_2: Particle,
-    theta0: float,
-    k: float,
-    epsilon: float = 1e-4,
-    **kwargs,
-) -> tuple[Constraint, Constraint, Constraint]:
-    ref = Reference(
-        central_particle=central_particle,
-        outer_particle_1=outer_particle_1,
-        outer_particle_2=outer_particle_2,
-        theta0=theta0,
-        k=k,
-        epsilon=epsilon,
-        **kwargs,
-    )
+def make_rope_constraint(particle, pivot_particle, d_max, dt):
+    ref = Reference(particle=particle, pivot_particle=pivot_particle, d_max=d_max, dt=dt)
+    return Constraint(lambda **kw: rope_force(kw["particle"].m, kw["particle"].x, kw["particle"].v, kw["pivot_particle"].x, kw["pivot_particle"].v, kw["d_max"], kw["dt"]), ref)
 
-    cache: dict[str, None | tuple] = {
-        "key": None,
-        "result": None,
-    }
 
-    def compute(cp, op1, op2, theta0, k, epsilon):
-        key = (cp.x.tobytes(), op1.x.tobytes(), op2.x.tobytes(), theta0, k, epsilon)
-        if key != cache["key"]:
-            cache["result"] = torsion_spring_force(
-                theta0, k, op1.x - cp.x, op2.x - cp.x, epsilon
-            )
-            cache["key"] = key
-        return cache["result"]
+def torsion_spring_force(theta0, k, v1, v2, epsilon=1e-4):
+    v1, v2 = _tensor(v1), _tensor(v2)
+    single = v1.ndim == 1
+    if single:
+        v1, v2 = v1[None], v2[None]
+    theta0, k, epsilon = (_tensor(x).reshape(-1, 1) for x in (theta0, k, epsilon))
+    length1 = torch.linalg.vector_norm(v1, dim=1, keepdim=True)
+    length2 = torch.linalg.vector_norm(v2, dim=1, keepdim=True)
+    degenerate = (length1 < epsilon) | (length2 < epsilon)
+    l1, l2 = length1.clamp_min(1.0), length2.clamp_min(1.0)
+    u1, u2 = v1 / l1, v2 / l2
+    dot = (u1 * u2).sum(dim=1, keepdim=True)
+    cross = (u1[:, 0] * u2[:, 1] - u1[:, 1] * u2[:, 0]).abs().reshape(-1, 1)
+    theta = torch.atan2(cross, dot)
+    delta = theta - theta0
+    sign = torch.sign(delta)
+    bisector = u1 + u2
+    bl = torch.linalg.vector_norm(bisector, dim=1, keepdim=True)
+    fallback = torch.stack((-u1[:, 1], u1[:, 0]), dim=1)
+    direction = torch.where((bl < epsilon), fallback, bisector / bl.clamp_min(1.0))
+    central = -sign * (2 * k * delta * torch.cos(delta / 2)) * direction
+    perp1 = torch.stack((-u1[:, 1], u1[:, 0]), dim=1)
+    perp2 = torch.stack((u2[:, 1], -u2[:, 0]), dim=1)
+    scalar = sign * k * delta
+    outer1, outer2 = scalar / l1 * perp1, scalar / l2 * perp2
+    mask = ~degenerate
+    central, outer1, outer2 = (torch.where(mask, force, torch.zeros_like(force)) for force in (central, outer1, outer2))
+    return tuple(force[0] for force in (central, outer1, outer2)) if single else (central, outer1, outer2)
 
-    def make_wrapper(index: int):
-        def torsion_spring_wrapper(**kwargs) -> np.ndarray:
-            cp = kwargs["central_particle"]
-            op1 = kwargs["outer_particle_1"]
-            op2 = kwargs["outer_particle_2"]
-            result = compute(
-                cp, op1, op2, kwargs["theta0"], kwargs["k"], kwargs["epsilon"]
-            )
-            if result is None:
-                return np.zeros(2)
 
-            return result[index]
-
-        return torsion_spring_wrapper
-
-    return (
-        Constraint(make_wrapper(0), reference=ref),
-        Constraint(make_wrapper(1), reference=ref),
-        Constraint(make_wrapper(2), reference=ref),
-    )
+def make_torsion_spring_constraint(central_particle, outer_particle_1, outer_particle_2, theta0, k, epsilon=1e-4, **kwargs):
+    ref = Reference(central_particle=central_particle, outer_particle_1=outer_particle_1, outer_particle_2=outer_particle_2, theta0=theta0, k=k, epsilon=epsilon, **kwargs)
+    cache = {}
+    def compute():
+        result = torsion_spring_force(ref.theta0, ref.k, outer_particle_1.x - central_particle.x, outer_particle_2.x - central_particle.x, ref.epsilon)
+        return result
+    def wrapper(index):
+        return lambda **_: compute()[index]
+    return tuple(Constraint(wrapper(i), ref) for i in range(3))
 
 
 def set_constraint(constraint_func: Callable, **kwargs) -> Constraint:
-    reference = Reference()
-
-    for key in constraint_func.__annotations__.keys():
-        setattr(reference, key, kwargs[key])
-
+    reference = Reference(**{key: kwargs[key] for key in constraint_func.__annotations__})
     return Constraint(constraint_func, reference)
 
 
-def add_constraint_to_particle(particle: Particle, *constraint: Constraint) -> None:
-    particle.constraints.extend(constraint)
+def add_constraint_to_particle(particle, *constraints) -> None:
+    particle.constraints.extend(constraints)
 
 
-def stromer(
-    x: np.ndarray, xp: np.ndarray, a: np.ndarray, dt: float, dtp: None | float = None
-) -> np.ndarray:
-    """Computes next stromer position `xn`.
-
-    Args:
-        x (ndarray): current position of the object
-        xp (ndarray): previous object's position
-        a (ndarray): current acceleration
-        dt (float): time step
-        dtp (None, float): previous time step (for time corrected integration)
-    """
+def stromer(x, xp, a, dt, dtp=None):
     if dtp is None or dt == dtp:
-        xn = (2 * x - xp) + a * dt**2  # no time correction
-    else:
-        xn = (
-            x + (x - xp) * (dt / dtp) + (a / 2) * (dt + dtp) * dt
-        )  # time corrected integraion
-
-    return xn
+        return 2 * x - xp + a * dt**2
+    return x + (x - xp) * (dt / dtp) + (a / 2) * (dt + dtp) * dt
 
 
-def randomize_particle_property(
-    particle: Particle,
-    property: str,
-    r: float,
-    dx: list | np.ndarray | None = None,
-    dy: list | np.ndarray | None = None,
-) -> None:
-    theta = 2 * np.pi * np.random.rand()
-    p = getattr(particle, property)
-    p += r * np.array([np.cos(theta), np.sin(theta)])
-
+def randomize_particle_property(particle, property, r, dx=None, dy=None) -> None:
+    theta = 2 * math.pi * torch.rand((), device=particle.x.device, dtype=particle.x.dtype)
+    value = getattr(particle, property)
+    value += r * torch.stack((torch.cos(theta), torch.sin(theta)))
     if property == "x":
-        particle.xp = particle.x.copy()
-
-
-def main() -> None:
-
-    # Create the particles:
-    particle1 = Particle(
-        1.0,
-        [0.0, 0.0],
-        [0.0, 0.0],
-    )
-
-    particle2 = Particle(
-        1.0,
-        [1.0, 0.0],
-        [0.0, 0.0],
-    )
-
-    ref = Reference(x1=particle2.x, x2=particle1.x, k=1, dr=0.95)
-
-    constraint = Constraint(elastic_force, reference=ref)
-
-    print(particle2.x)
-    # return
-
-    particle2.constraints.append(constraint)
-
-    simulation = Simulation([particle1, particle2])
-    xt = []
-    yt = []
-    start_time = time.perf_counter()
-
-    while True:
-        simulation.run(n=1)
-        end_time = time.perf_counter()
-
-        xt.append(particle2.x[0])
-        yt.append(particle2.x[1])
-
-        print(round(end_time - start_time, 2), end=20 * " " + "\r")
-        if (end_time - start_time) > 100:
-            break
-
-    plt.figure()
-    plt.plot(xt)
-    plt.plot(yt)
-    plt.show()
-
-
-if __name__ == "__main__":
-    main()
+        particle.xp = particle.x.clone()
