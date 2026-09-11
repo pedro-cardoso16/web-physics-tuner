@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 import pandas as pd
 import json
 import os
@@ -9,15 +10,12 @@ def rotate_particles(*args: Particle, pivot: np.ndarray, angle_rad: float) -> No
     c = np.cos(angle_rad)
     s = np.sin(angle_rad)
 
-    rot_matrix = np.array(
-        [
-            [c, -s],
-            [s, c],
-        ]
-    )
-
     for particle in args:
-        particle.x = (rot_matrix @ (particle.x - pivot)) + pivot
+        pivot_tensor = torch.as_tensor(pivot, dtype=particle.x.dtype, device=particle.x.device)
+        rotation = torch.as_tensor(
+            [[c, -s], [s, c]], dtype=particle.x.dtype, device=particle.x.device
+        )
+        particle.x = (rotation @ (particle.x - pivot_tensor)) + pivot_tensor
 
 
 def normalize_data_for_neural_net(file: str, output_file: str, **kwargs):
